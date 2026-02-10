@@ -36,8 +36,8 @@ export default {
 
     // Register the inbound service for receiving messages
     api.registerService({ 
-      start: async (serviceApi: OpenClawAPI, serviceConfig: BeagleConfig) => {
-        await startInboundService(serviceApi, finalConfig);
+      start: async () => {
+        await startInboundService(api, finalConfig);
       }
     });
 

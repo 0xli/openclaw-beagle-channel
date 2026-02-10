@@ -22,7 +22,7 @@ npm install openclaw-channel-beagle
 
 ### For Ubuntu Production Deployment
 
-1. Install Node.js 18+ and OpenClaw:
+1. Install Node.js 20+ and OpenClaw:
 ```bash
 curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
 sudo apt-get install -y nodejs
