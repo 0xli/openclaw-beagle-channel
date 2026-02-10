@@ -1,0 +1,29 @@
+{
+  "id": "beagle",
+  "channels": ["beagle"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean",
+        "default": true
+      },
+      "dataDir": {
+        "type": "string",
+        "default": "./data/beagle"
+      },
+      "bootstrapNodes": {
+        "type": "string"
+      },
+      "userName": {
+        "type": "string",
+        "default": "OpenClaw Agent"
+      },
+      "userDescription": {
+        "type": "string",
+        "default": "OpenClaw AI Assistant via Beagle"
+      }
+    }
+  }
+}
