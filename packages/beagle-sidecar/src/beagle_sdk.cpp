@@ -632,6 +632,8 @@ static void send_welcome_once(RuntimeState* state, const std::string& peer, cons
   }
 }
 
+bool friend_list_callback(const CarrierFriendInfo* info, void* context);
+
 void friend_message_callback(Carrier* carrier,
                              const char* from,
                              const void* msg,
@@ -661,10 +663,10 @@ void friend_message_callback(Carrier* carrier,
     }
   }
 
-  std::ostringstream msg;
-  msg << "[beagle-sdk] message (" << (offline ? "offline" : "online")
-      << ") from " << incoming.peer << ": " << incoming.text;
-  log_line(msg.str());
+  std::ostringstream line;
+  line << "[beagle-sdk] message (" << (offline ? "offline" : "online")
+       << ") from " << incoming.peer << ": " << incoming.text;
+  log_line(line.str());
 }
 
 void friend_request_callback(Carrier* carrier,
@@ -708,6 +710,16 @@ void ready_callback(Carrier* carrier, void* context) {
     state->status.ready = true;
   }
   log_line("[beagle-sdk] ready");
+  if (carrier && state) {
+    int rc = carrier_get_friends(carrier, friend_list_callback, state);
+    if (rc < 0) {
+      std::ostringstream msg;
+      msg << "[beagle-sdk] carrier_get_friends failed: 0x" << std::hex << carrier_get_error() << std::dec;
+      log_line(msg.str());
+    } else {
+      log_line("[beagle-sdk] carrier_get_friends ok");
+    }
+  }
 }
 
 void friend_connection_callback(Carrier* carrier,
@@ -759,6 +771,16 @@ void friend_presence_callback(Carrier* carrier,
   auto* state = static_cast<RuntimeState*>(context);
   if (!state || !friendid) return;
   update_friend_status(state, friendid, -1, static_cast<int>(presence), false);
+}
+
+bool friend_list_callback(const CarrierFriendInfo* info, void* context) {
+  auto* state = static_cast<RuntimeState*>(context);
+  if (!state || !info) return false;
+  const char* fid = info->user_info.userid;
+  if (!fid || !*fid) return true;
+  log_line(std::string("[beagle-sdk] friend list item ") + fid);
+  store_friend_info(state, fid, info);
+  return true;
 }
 
 void friend_invite_callback(Carrier* carrier,

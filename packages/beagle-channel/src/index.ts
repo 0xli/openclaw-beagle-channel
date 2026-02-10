@@ -124,23 +124,27 @@ async function handleInboundEvent(api: any, accountId: string, account: BeagleAc
     const rawTs = ev?.ts ?? 0;
     const normalizedTs = rawTs > 10_000_000_000_000 ? Math.floor(rawTs / 1000) : rawTs;
     const timestamp = normalizedTs || Date.now();
+    const dispatchStart = Date.now();
 
+    const peerId = String(ev?.peer ?? "");
     const route = core.channel.routing.resolveAgentRoute({
       cfg: api?.config ?? {},
       channel: "beagle",
       accountId,
       peer: {
         kind: "dm",
-        id: String(ev?.peer ?? "")
+        id: peerId
       }
     });
+
+    const sessionKey = `beagle:${accountId}:${peerId}`;
 
     const storePath = core.channel.session.resolveStorePath(api?.config?.session?.store, {
       agentId: route.agentId
     });
     const previousTimestamp = core.channel.session.readSessionUpdatedAt({
       storePath,
-      sessionKey: route.sessionKey
+      sessionKey
     });
     const body = rawBody;
 
@@ -150,25 +154,25 @@ async function handleInboundEvent(api: any, accountId: string, account: BeagleAc
       BodyForCommands: rawBody,
       RawBody: rawBody,
       CommandBody: rawBody,
-      From: `beagle:${String(ev?.peer ?? "")}`,
-      To: `beagle:${String(ev?.peer ?? "")}`,
-      SessionKey: route.sessionKey,
+      From: `beagle:${peerId}`,
+      To: `beagle:${peerId}`,
+      SessionKey: sessionKey,
       AccountId: route.accountId,
       ChatType: "direct",
-      ConversationLabel: String(ev?.peer ?? ""),
-      SenderId: String(ev?.peer ?? ""),
+      ConversationLabel: peerId,
+      SenderId: peerId,
       Provider: "beagle",
       Surface: "beagle",
       MessageSid: ev?.msgId,
       Timestamp: timestamp,
       OriginatingChannel: "beagle",
-      OriginatingTo: `beagle:${String(ev?.peer ?? "")}`
+      OriginatingTo: `beagle:${peerId}`
     });
 
-    api?.logger?.info?.(`[beagle] route agent=${route.agentId} session=${route.sessionKey}`);
+    api?.logger?.info?.(`[beagle] route agent=${route.agentId} session=${sessionKey}`);
     await core.channel.session.recordInboundSession({
       storePath,
-      sessionKey: ctxPayload.SessionKey ?? route.sessionKey,
+      sessionKey,
       ctx: ctxPayload,
       onRecordError: (err: any) => {
         api?.logger?.warn?.(`[beagle] failed updating session meta: ${String(err)}`);
@@ -176,7 +180,8 @@ async function handleInboundEvent(api: any, accountId: string, account: BeagleAc
     });
 
     const client = createSidecarClient(account);
-    const { queuedFinal } = await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+
+    const dispatchPromise = core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
       ctx: ctxPayload,
       cfg: api?.config ?? {},
       dispatcherOptions: {
@@ -187,7 +192,7 @@ async function handleInboundEvent(api: any, accountId: string, account: BeagleAc
           if (mediaUrl) {
             api?.logger?.info?.("[beagle] sendMedia");
             await client.sendMedia({
-              peer: String(ev?.peer ?? ""),
+              peer: peerId,
               caption: text,
               mediaUrl
             });
@@ -195,7 +200,7 @@ async function handleInboundEvent(api: any, accountId: string, account: BeagleAc
           }
           if (text) {
             api?.logger?.info?.("[beagle] sendText");
-            await client.sendText({ peer: String(ev?.peer ?? ""), text });
+            await client.sendText({ peer: peerId, text });
           }
         },
         onError: (err: any, info: any) => {
@@ -203,7 +208,19 @@ async function handleInboundEvent(api: any, accountId: string, account: BeagleAc
         }
       }
     });
-    api?.logger?.info?.(`[beagle] dispatch queuedFinal=${queuedFinal}`);
+    const env = (globalThis as any)?.process?.env ?? {};
+    const timeoutMs = Number(env.BEAGLE_DISPATCH_TIMEOUT_MS || 30000);
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`dispatch timeout after ${timeoutMs}ms`)), timeoutMs)
+    );
+    let queuedFinal: any;
+    try {
+      const result: any = await Promise.race([dispatchPromise, timeoutPromise]);
+      queuedFinal = result?.queuedFinal;
+      api?.logger?.info?.(`[beagle] dispatch queuedFinal=${queuedFinal} duration_ms=${Date.now() - dispatchStart}`);
+    } catch (err: any) {
+      api?.logger?.warn?.(`[beagle] dispatch failed duration_ms=${Date.now() - dispatchStart}: ${String(err)}`);
+    }
   } catch (err: any) {
     api?.logger?.warn?.(`[beagle] handleInboundEvent failed: ${String(err)}`);
   }
