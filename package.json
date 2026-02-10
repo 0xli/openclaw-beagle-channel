@@ -12,6 +12,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
+    "test": "npm run build && node --import tsx test.ts",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
