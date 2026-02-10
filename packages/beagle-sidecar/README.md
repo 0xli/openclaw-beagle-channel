@@ -20,7 +20,13 @@ cmake -S . -B build -DBEAGLE_SDK_STUB=OFF -DBEAGLE_SDK_ROOT=$BEAGLE_SDK_ROOT
 cmake --build build
 ```
 
-Then wire the SDK headers/libraries in `CMakeLists.txt` and implement the real logic in `src/beagle_sdk.cpp`.
+If your SDK build directory is non-standard, also pass `-DBEAGLE_SDK_BUILD_DIR=/path/to/build`.
+
+Run with a Carrier config:
+
+```bash
+./build/beagle-sidecar --config $BEAGLE_SDK_ROOT/config/carrier.conf --data-dir ~/.carrier
+```
 
 ## HTTP API
 

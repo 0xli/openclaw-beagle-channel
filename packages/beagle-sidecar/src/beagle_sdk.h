@@ -17,7 +17,18 @@ struct BeagleIncomingMessage {
 using BeagleIncomingCallback = std::function<void(const BeagleIncomingMessage&)>;
 
 struct BeagleSdkOptions {
+  std::string config_path;
   std::string data_dir;
+};
+
+struct BeagleStatus {
+  bool ready = false;
+  bool connected = false;
+  std::string last_peer;
+  long long last_online_ts = 0;
+  long long last_offline_ts = 0;
+  unsigned long long online_count = 0;
+  unsigned long long offline_count = 0;
 };
 
 class BeagleSdk {
@@ -32,4 +43,12 @@ public:
                   const std::string& media_url,
                   const std::string& media_type,
                   const std::string& filename);
+
+  const std::string& userid() const { return user_id_; }
+  const std::string& address() const { return address_; }
+  BeagleStatus status() const;
+
+private:
+  std::string user_id_;
+  std::string address_;
 };

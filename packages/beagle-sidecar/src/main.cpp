@@ -124,6 +124,16 @@ static void send_response(int fd, int code, const std::string& content_type, con
   send(fd, out.c_str(), out.size(), 0);
 }
 
+static std::string to_iso8601(long long ts) {
+  if (ts <= 0) return "";
+  time_t t = static_cast<time_t>(ts);
+  struct tm tm_buf;
+  if (!localtime_r(&t, &tm_buf)) return "";
+  char out[32];
+  if (strftime(out, sizeof(out), "%Y-%m-%d %H:%M:%S", &tm_buf) == 0) return "";
+  return std::string(out);
+}
+
 static void push_event(const BeagleIncomingMessage& msg) {
   Event ev;
   ev.peer = msg.peer;
@@ -143,6 +153,7 @@ struct ServerOptions {
   int port = 39091;
   std::string token;
   std::string data_dir = "./data";
+  std::string config_path;
 };
 
 static ServerOptions parse_args(int argc, char** argv) {
@@ -155,16 +166,49 @@ static ServerOptions parse_args(int argc, char** argv) {
       opts.token = argv[++i];
     } else if (arg == "--data-dir" && i + 1 < argc) {
       opts.data_dir = argv[++i];
+    } else if (arg == "--config" && i + 1 < argc) {
+      opts.config_path = argv[++i];
     }
   }
   return opts;
 }
 
+static std::string get_env(const char* key) {
+  const char* value = std::getenv(key);
+  return value ? std::string(value) : std::string();
+}
+
+static bool file_exists(const std::string& path) {
+  return access(path.c_str(), R_OK) == 0;
+}
+
+static std::string resolve_config_path(const ServerOptions& opts) {
+  if (!opts.config_path.empty()) return opts.config_path;
+
+  std::string env_config = get_env("BEAGLE_CONFIG");
+  if (!env_config.empty()) return env_config;
+
+  std::string sdk_root = get_env("BEAGLE_SDK_ROOT");
+  if (!sdk_root.empty()) {
+    std::string candidate = sdk_root + "/config/carrier.conf";
+    if (file_exists(candidate)) return candidate;
+  }
+
+  if (file_exists("./carrier.conf")) return "./carrier.conf";
+
+  return std::string();
+}
+
 int main(int argc, char** argv) {
   ServerOptions opts = parse_args(argc, argv);
+  std::string config_path = resolve_config_path(opts);
+  if (config_path.empty()) {
+    std::cerr << "Missing Carrier config. Provide --config or set BEAGLE_SDK_ROOT.\n";
+    return 1;
+  }
 
   BeagleSdk sdk;
-  if (!sdk.start({opts.data_dir}, push_event)) {
+  if (!sdk.start({config_path, opts.data_dir}, push_event)) {
     std::cerr << "Failed to start Beagle SDK\n";
     return 1;
   }
@@ -231,7 +275,31 @@ int main(int argc, char** argv) {
     }
 
     if (method == "GET" && path == "/health") {
-      send_response(client_fd, 200, "application/json", "{\"ok\":true}");
+      std::ostringstream oss;
+      oss << "{"
+          << "\"ok\":true"
+          << ",\"userId\":\"" << json_escape(sdk.userid()) << "\""
+          << ",\"address\":\"" << json_escape(sdk.address()) << "\""
+          << "}";
+      send_response(client_fd, 200, "application/json", oss.str());
+    } else if (method == "GET" && path == "/status") {
+      BeagleStatus status = sdk.status();
+      std::string last_online_human = to_iso8601(status.last_online_ts);
+      std::string last_offline_human = to_iso8601(status.last_offline_ts);
+      std::ostringstream oss;
+      oss << "{"
+          << "\"ok\":true"
+          << ",\"ready\":" << (status.ready ? "true" : "false")
+          << ",\"connected\":" << (status.connected ? "true" : "false")
+          << ",\"lastPeer\":\"" << json_escape(status.last_peer) << "\""
+          << ",\"lastOnlineTs\":" << status.last_online_ts
+          << ",\"lastOfflineTs\":" << status.last_offline_ts
+          << ",\"lastOnline\":\"" << json_escape(last_online_human) << "\""
+          << ",\"lastOffline\":\"" << json_escape(last_offline_human) << "\""
+          << ",\"onlineCount\":" << status.online_count
+          << ",\"offlineCount\":" << status.offline_count
+          << "}";
+      send_response(client_fd, 200, "application/json", oss.str());
     } else if (method == "GET" && path == "/events") {
       std::vector<Event> events;
       {
