@@ -1,10 +1,6 @@
 # Beagle Chat Carrier Sidecar
 
-# Beagle Chat Carrier Sidecar
-
 ⚠️ **Current Status**: This directory contains the complete design and structure for the Carrier sidecar daemon. The Carrier SDK integration and WebSocket event streaming are currently **stub implementations** that need to be completed for production use.
-
-This directory contains the design and implementation for the Carrier sidecar daemon.
 
 ## Current Implementation Status
 
