@@ -1,8 +1,6 @@
 import express from 'express';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
-import { readFileSync, existsSync } from 'fs';
-import { join } from 'path';
 
 /**
  * Reference implementation of Beagle Sidecar API
