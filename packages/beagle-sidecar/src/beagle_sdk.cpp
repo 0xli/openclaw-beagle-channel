@@ -55,35 +55,6 @@ extern "C" {
 }
 
 namespace {
-struct RuntimeState {
-  Carrier* carrier = nullptr;
-  BeagleIncomingCallback on_incoming;
-  std::thread loop_thread;
-  std::mutex state_mu;
-  std::string persistent_location;
-  std::string welcome_message;
-  std::string profile_path;
-  std::string welcome_state_path;
-  std::string db_config_path;
-  std::string friend_state_path;
-  std::string friend_event_log_path;
-  std::string user_id;
-  std::string address;
-  BeagleStatus status;
-  std::unordered_set<std::string> welcomed_peers;
-  std::map<std::string, struct FriendState> friend_state;
-  struct DbConfig db;
-};
-
-struct ProfileInfo {
-  std::string name;
-  std::string gender;
-  std::string phone;
-  std::string email;
-  std::string description;
-  std::string region;
-};
-
 struct FriendState {
   std::string friendid;
   std::string name;
@@ -104,6 +75,35 @@ struct DbConfig {
   std::string user = "beagle";
   std::string password = "A1anSn00py";
   std::string database = "beagle";
+};
+
+struct ProfileInfo {
+  std::string name;
+  std::string gender;
+  std::string phone;
+  std::string email;
+  std::string description;
+  std::string region;
+};
+
+struct RuntimeState {
+  Carrier* carrier = nullptr;
+  BeagleIncomingCallback on_incoming;
+  std::thread loop_thread;
+  std::mutex state_mu;
+  std::string persistent_location;
+  std::string welcome_message;
+  std::string profile_path;
+  std::string welcome_state_path;
+  std::string db_config_path;
+  std::string friend_state_path;
+  std::string friend_event_log_path;
+  std::string user_id;
+  std::string address;
+  BeagleStatus status;
+  std::unordered_set<std::string> welcomed_peers;
+  std::map<std::string, FriendState> friend_state;
+  DbConfig db;
 };
 
 static bool file_exists(const std::string& path) {
