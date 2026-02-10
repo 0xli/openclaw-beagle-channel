@@ -1,0 +1,72 @@
+{
+  "name": "openclaw-beagle-channel",
+  "version": "0.1.0",
+  "description": "OpenClaw channel plugin for Beagle Chat - enables users to DM OpenClaw agent",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "index.ts"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "openclaw",
+    "beagle",
+    "chat",
+    "channel",
+    "plugin",
+    "messaging",
+    "dm",
+    "direct-message"
+  ],
+  "author": "0xli",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/0xli/openclaw-beagle-channel.git"
+  },
+  "bugs": {
+    "url": "https://github.com/0xli/openclaw-beagle-channel/issues"
+  },
+  "homepage": "https://github.com/0xli/openclaw-beagle-channel#readme",
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "channel": {
+      "id": "beagle",
+      "label": "Beagle Chat",
+      "selectionLabel": "Beagle Chat (DM)",
+      "docsPath": "/channels/beagle",
+      "docsLabel": "beagle",
+      "blurb": "Beagle Chat direct messaging integration.",
+      "aliases": [
+        "beagle-dm"
+      ],
+      "order": 80
+    },
+    "install": {
+      "npmSpec": "openclaw-beagle-channel",
+      "localPath": ".",
+      "defaultChoice": "npm"
+    }
+  },
+  "dependencies": {
+    "@sinclair/typebox": "0.34.48",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.10",
+    "openclaw": "2026.2.9",
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.0"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.1.29"
+  }
+}
