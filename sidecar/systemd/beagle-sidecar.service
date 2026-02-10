@@ -1,0 +1,21 @@
+[Unit]
+Description=Beagle Chat Carrier Sidecar
+After=network.target
+
+[Service]
+Type=simple
+User=beagle
+Group=beagle
+ExecStart=/usr/local/bin/beagle-sidecar --config /etc/beagle-sidecar/config.json
+Restart=on-failure
+RestartSec=10s
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/beagle-sidecar /var/log/beagle-sidecar
+
+[Install]
+WantedBy=multi-user.target
