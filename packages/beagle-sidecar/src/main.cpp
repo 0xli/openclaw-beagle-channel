@@ -26,6 +26,19 @@ struct Event {
   long long ts = 0;
 };
 
+static std::string log_ts() {
+  std::time_t now = std::time(nullptr);
+  std::tm tm_buf{};
+  localtime_r(&now, &tm_buf);
+  char out[32];
+  if (std::strftime(out, sizeof(out), "%Y-%m-%d %H:%M:%S", &tm_buf) == 0) return "";
+  return std::string(out);
+}
+
+static void log_line(const std::string& msg) {
+  std::cerr << "[" << log_ts() << "] " << msg << "\n";
+}
+
 static std::mutex g_events_mu;
 static std::vector<Event> g_events;
 
@@ -168,10 +181,9 @@ static void push_event(const BeagleIncomingMessage& msg) {
 
   std::lock_guard<std::mutex> lock(g_events_mu);
   g_events.push_back(std::move(ev));
-  std::cerr << "[sidecar] queued event peer=" << msg.peer
-            << " text_len=" << msg.text.size()
-            << " ts=" << msg.ts
-            << "\n";
+  log_line(std::string("[sidecar] queued event peer=") + msg.peer
+           + " text_len=" + std::to_string(msg.text.size())
+           + " ts=" + std::to_string(msg.ts));
 }
 
 struct ServerOptions {
@@ -228,19 +240,19 @@ int main(int argc, char** argv) {
   ServerOptions opts = parse_args(argc, argv);
   std::string config_path = resolve_config_path(opts);
   if (config_path.empty()) {
-    std::cerr << "Missing Carrier config. Provide --config or set BEAGLE_SDK_ROOT.\n";
+    log_line("Missing Carrier config. Provide --config or set BEAGLE_SDK_ROOT.");
     return 1;
   }
 
   BeagleSdk sdk;
   if (!sdk.start({config_path, opts.data_dir}, push_event)) {
-    std::cerr << "Failed to start Beagle SDK\n";
+    log_line("Failed to start Beagle SDK");
     return 1;
   }
 
   int server_fd = socket(AF_INET, SOCK_STREAM, 0);
   if (server_fd < 0) {
-    std::cerr << "Failed to create socket\n";
+    log_line("Failed to create socket");
     return 1;
   }
 
@@ -253,16 +265,16 @@ int main(int argc, char** argv) {
   addr.sin_port = htons(static_cast<uint16_t>(opts.port));
 
   if (bind(server_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-    std::cerr << "Bind failed\n";
+    log_line("Bind failed");
     return 1;
   }
 
   if (listen(server_fd, 16) < 0) {
-    std::cerr << "Listen failed\n";
+    log_line("Listen failed");
     return 1;
   }
 
-  std::cerr << "Beagle sidecar listening on 0.0.0.0:" << opts.port << "\n";
+  log_line(std::string("Beagle sidecar listening on 0.0.0.0:") + std::to_string(opts.port));
 
   while (true) {
     int client_fd = accept(server_fd, nullptr, nullptr);
@@ -293,8 +305,8 @@ int main(int argc, char** argv) {
       std::string auth = header_value(headers, "Authorization");
       std::string expected = "Bearer " + opts.token;
       if (auth != expected) {
-        std::cerr << "[sidecar] unauthorized request for " << path
-                  << " from " << client_ip(client_fd) << "\n";
+        log_line(std::string("[sidecar] unauthorized request for ") + path
+                 + " from " + client_ip(client_fd));
         send_response(client_fd, 401, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}");
         close(client_fd);
         continue;
@@ -335,10 +347,11 @@ int main(int argc, char** argv) {
       }
       if (!events.empty()) {
         std::string ua = header_value(headers, "User-Agent");
-        std::cerr << "[sidecar] /events -> " << events.size() << " event(s)"
-                  << " from " << client_ip(client_fd);
-        if (!ua.empty()) std::cerr << " ua=" << ua;
-        std::cerr << "\n";
+        std::ostringstream msg;
+        msg << "[sidecar] /events -> " << events.size() << " event(s)"
+            << " from " << client_ip(client_fd);
+        if (!ua.empty()) msg << " ua=" << ua;
+        log_line(msg.str());
       }
       send_response(client_fd, 200, "application/json", events_to_json(std::move(events)));
     } else if (method == "POST" && path == "/sendText") {
@@ -346,8 +359,8 @@ int main(int argc, char** argv) {
       std::string text;
       extract_json_string(body, "peer", peer);
       extract_json_string(body, "text", text);
-      std::cerr << "[sidecar] /sendText peer=" << peer
-                << " text_len=" << text.size() << "\n";
+      log_line(std::string("[sidecar] /sendText peer=") + peer
+               + " text_len=" + std::to_string(text.size()));
 
       bool ok = sdk.send_text(peer, text);
       send_response(client_fd, ok ? 200 : 500, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
@@ -364,10 +377,10 @@ int main(int argc, char** argv) {
       extract_json_string(body, "mediaUrl", media_url);
       extract_json_string(body, "mediaType", media_type);
       extract_json_string(body, "filename", filename);
-      std::cerr << "[sidecar] /sendMedia peer=" << peer
-                << " caption_len=" << caption.size()
-                << " media_url_len=" << media_url.size()
-                << " media_path_len=" << media_path.size() << "\n";
+      log_line(std::string("[sidecar] /sendMedia peer=") + peer
+               + " caption_len=" + std::to_string(caption.size())
+               + " media_url_len=" + std::to_string(media_url.size())
+               + " media_path_len=" + std::to_string(media_path.size()));
 
       bool ok = sdk.send_media(peer, caption, media_path, media_url, media_type, filename);
       send_response(client_fd, ok ? 200 : 500, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");

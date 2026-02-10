@@ -55,6 +55,19 @@ extern "C" {
 }
 
 namespace {
+static std::string log_ts() {
+  std::time_t now = std::time(nullptr);
+  std::tm tm_buf{};
+  localtime_r(&now, &tm_buf);
+  char out[32];
+  if (std::strftime(out, sizeof(out), "%Y-%m-%d %H:%M:%S", &tm_buf) == 0) return "";
+  return std::string(out);
+}
+
+static void log_line(const std::string& msg) {
+  std::cerr << "[" << log_ts() << "] " << msg << "\n";
+}
+
 struct FriendState {
   std::string friendid;
   std::string name;
@@ -218,7 +231,7 @@ static void ensure_profile_file(RuntimeState* state) {
   if (!state || state->profile_path.empty()) return;
   if (file_exists(state->profile_path)) return;
   if (!write_file(state->profile_path, default_profile_json())) {
-    std::cerr << "[beagle-sdk] failed to write default profile to " << state->profile_path << "\n";
+    log_line(std::string("[beagle-sdk] failed to write default profile to ") + state->profile_path);
   }
 }
 
@@ -226,7 +239,7 @@ static void ensure_db_file(RuntimeState* state) {
   if (!state || state->db_config_path.empty()) return;
   if (file_exists(state->db_config_path)) return;
   if (!write_file(state->db_config_path, default_db_json())) {
-    std::cerr << "[beagle-sdk] failed to write default db config to " << state->db_config_path << "\n";
+    log_line(std::string("[beagle-sdk] failed to write default db config to ") + state->db_config_path);
   }
 }
 
@@ -417,7 +430,7 @@ static void ensure_db(RuntimeState* state, const DbConfig& db) {
       ");";
   int rc = mysql_exec(db, schema);
   if (rc != 0) {
-    std::cerr << "[beagle-sdk] mysql schema init failed rc=" << rc << "\n";
+    log_line(std::string("[beagle-sdk] mysql schema init failed rc=") + std::to_string(rc));
   }
 }
 
@@ -576,9 +589,11 @@ static void apply_profile(RuntimeState* state, const ProfileInfo& profile) {
 
   int rc = carrier_set_self_info(state->carrier, &info);
   if (rc < 0) {
-    std::cerr << "[beagle-sdk] set self info failed: 0x" << std::hex << carrier_get_error() << std::dec << "\n";
+    std::ostringstream msg;
+    msg << "[beagle-sdk] set self info failed: 0x" << std::hex << carrier_get_error() << std::dec;
+    log_line(msg.str());
   } else {
-    std::cerr << "[beagle-sdk] self info updated\n";
+    log_line("[beagle-sdk] self info updated");
   }
 }
 
@@ -601,8 +616,10 @@ static void send_welcome_once(RuntimeState* state, const std::string& peer, cons
                                        nullptr,
                                        nullptr);
   if (rc < 0) {
-    std::cerr << "[beagle-sdk] welcome message failed (" << reason
-              << "): 0x" << std::hex << carrier_get_error() << std::dec << "\n";
+    std::ostringstream msg;
+    msg << "[beagle-sdk] welcome message failed (" << reason
+        << "): 0x" << std::hex << carrier_get_error() << std::dec;
+    log_line(msg.str());
   } else {
     {
       std::lock_guard<std::mutex> lock(state->state_mu);
@@ -611,8 +628,7 @@ static void send_welcome_once(RuntimeState* state, const std::string& peer, cons
     if (!state->welcome_state_path.empty()) {
       append_line(state->welcome_state_path, peer);
     }
-    std::cerr << "[beagle-sdk] welcome message sent (" << reason
-              << ") to " << peer << "\n";
+    log_line(std::string("[beagle-sdk] welcome message sent (") + reason + ") to " + peer);
   }
 }
 
@@ -645,8 +661,10 @@ void friend_message_callback(Carrier* carrier,
     }
   }
 
-  std::cerr << "[beagle-sdk] message (" << (offline ? "offline" : "online")
-            << ") from " << incoming.peer << ": " << incoming.text << "\n";
+  std::ostringstream msg;
+  msg << "[beagle-sdk] message (" << (offline ? "offline" : "online")
+      << ") from " << incoming.peer << ": " << incoming.text;
+  log_line(msg.str());
 }
 
 void friend_request_callback(Carrier* carrier,
@@ -660,9 +678,11 @@ void friend_request_callback(Carrier* carrier,
   if (!carrier || !userid) return;
   int rc = carrier_accept_friend(carrier, userid);
   if (rc < 0) {
-    std::cerr << "[beagle-sdk] accept friend failed: 0x" << std::hex << carrier_get_error() << std::dec << "\n";
+    std::ostringstream msg;
+    msg << "[beagle-sdk] accept friend failed: 0x" << std::hex << carrier_get_error() << std::dec;
+    log_line(msg.str());
   } else {
-    std::cerr << "[beagle-sdk] accepted friend: " << userid << "\n";
+    log_line(std::string("[beagle-sdk] accepted friend: ") + userid);
     send_welcome_once(state, userid, "accepted");
   }
 }
@@ -676,9 +696,8 @@ void connection_status_callback(Carrier* carrier,
     std::lock_guard<std::mutex> lock(state->state_mu);
     state->status.connected = (status == CarrierConnectionStatus_Connected);
   }
-  std::cerr << "[beagle-sdk] connection status: "
-            << (status == CarrierConnectionStatus_Connected ? "connected" : "disconnected")
-            << "\n";
+  log_line(std::string("[beagle-sdk] connection status: ")
+           + (status == CarrierConnectionStatus_Connected ? "connected" : "disconnected"));
 }
 
 void ready_callback(Carrier* carrier, void* context) {
@@ -688,7 +707,7 @@ void ready_callback(Carrier* carrier, void* context) {
     std::lock_guard<std::mutex> lock(state->state_mu);
     state->status.ready = true;
   }
-  std::cerr << "[beagle-sdk] ready\n";
+  log_line("[beagle-sdk] ready");
 }
 
 void friend_connection_callback(Carrier* carrier,
@@ -697,9 +716,8 @@ void friend_connection_callback(Carrier* carrier,
                                 void* context) {
   (void)carrier;
   auto* state = static_cast<RuntimeState*>(context);
-  std::cerr << "[beagle-sdk] friend " << (friendid ? friendid : "")
-            << " is " << (status == CarrierConnectionStatus_Connected ? "online" : "offline")
-            << "\n";
+  log_line(std::string("[beagle-sdk] friend ") + (friendid ? friendid : "")
+           + " is " + (status == CarrierConnectionStatus_Connected ? "online" : "offline"));
   if (status == CarrierConnectionStatus_Connected && friendid) {
     send_welcome_once(state, friendid, "online");
   }
@@ -719,7 +737,7 @@ void friend_info_callback(Carrier* carrier,
   (void)carrier;
   auto* state = static_cast<RuntimeState*>(context);
   if (!state || !friendid || !info) return;
-  std::cerr << "[beagle-sdk] friend info update for " << friendid << "\n";
+  log_line(std::string("[beagle-sdk] friend info update for ") + friendid);
   store_friend_info(state, friendid, info);
 }
 
@@ -729,7 +747,7 @@ void friend_added_callback(Carrier* carrier,
   (void)carrier;
   auto* state = static_cast<RuntimeState*>(context);
   if (!state || !info) return;
-  std::cerr << "[beagle-sdk] friend added " << info->user_info.userid << "\n";
+  log_line(std::string("[beagle-sdk] friend added ") + info->user_info.userid);
   store_friend_info(state, info->user_info.userid, info);
 }
 
@@ -754,8 +772,7 @@ void friend_invite_callback(Carrier* carrier,
   auto* state = static_cast<RuntimeState*>(context);
   std::string payload;
   if (data && len) payload.assign(static_cast<const char*>(data), len);
-  std::cerr << "[beagle-sdk] invite from " << (from ? from : "")
-            << " data=" << payload << "\n";
+  log_line(std::string("[beagle-sdk] invite from ") + (from ? from : "") + " data=" + payload);
 
   if (!state || !state->on_incoming || !from) return;
   BeagleIncomingMessage incoming;
@@ -777,13 +794,13 @@ static RuntimeState g_state;
 
 bool BeagleSdk::start(const BeagleSdkOptions& options, BeagleIncomingCallback on_incoming) {
   if (options.config_path.empty()) {
-    std::cerr << "[beagle-sdk] missing config file path\n";
+    log_line("[beagle-sdk] missing config file path");
     return false;
   }
 
   CarrierOptions opts;
   if (!carrier_config_load(options.config_path.c_str(), nullptr, &opts)) {
-    std::cerr << "[beagle-sdk] failed to load config: " << options.config_path << "\n";
+    log_line(std::string("[beagle-sdk] failed to load config: ") + options.config_path);
     return false;
   }
 
@@ -817,7 +834,9 @@ bool BeagleSdk::start(const BeagleSdkOptions& options, BeagleIncomingCallback on
   Carrier* carrier = carrier_new(&opts, &callbacks, &g_state);
   carrier_config_free(&opts);
   if (!carrier) {
-    std::cerr << "[beagle-sdk] carrier_new failed: 0x" << std::hex << carrier_get_error() << std::dec << "\n";
+    std::ostringstream msg;
+    msg << "[beagle-sdk] carrier_new failed: 0x" << std::hex << carrier_get_error() << std::dec;
+    log_line(msg.str());
     return false;
   }
 
@@ -832,8 +851,8 @@ bool BeagleSdk::start(const BeagleSdkOptions& options, BeagleIncomingCallback on
   user_id_ = g_state.user_id;
   address_ = g_state.address;
 
-  std::cerr << "[beagle-sdk] User ID: " << user_id_ << "\n";
-  std::cerr << "[beagle-sdk] Address: " << address_ << "\n";
+  log_line(std::string("[beagle-sdk] User ID: ") + user_id_);
+  log_line(std::string("[beagle-sdk] Address: ") + address_);
 
   ProfileInfo profile;
   load_profile(&g_state, profile);
@@ -847,7 +866,9 @@ bool BeagleSdk::start(const BeagleSdkOptions& options, BeagleIncomingCallback on
   g_state.loop_thread = std::thread([]() {
     int rc = carrier_run(g_state.carrier, 10);
     if (rc != 0) {
-      std::cerr << "[beagle-sdk] carrier_run failed: 0x" << std::hex << carrier_get_error() << std::dec << "\n";
+      std::ostringstream msg;
+      msg << "[beagle-sdk] carrier_run failed: 0x" << std::hex << carrier_get_error() << std::dec;
+      log_line(msg.str());
     }
   });
 
@@ -872,10 +893,12 @@ bool BeagleSdk::send_text(const std::string& peer, const std::string& text) {
                                        nullptr,
                                        nullptr);
   if (rc < 0) {
-    std::cerr << "[beagle-sdk] send_text failed: 0x" << std::hex << carrier_get_error() << std::dec << "\n";
+    std::ostringstream msg;
+    msg << "[beagle-sdk] send_text failed: 0x" << std::hex << carrier_get_error() << std::dec;
+    log_line(msg.str());
     return false;
   }
-  std::cerr << "[beagle-sdk] send_text ok msgid=" << msgid << " peer=" << peer << "\n";
+  log_line(std::string("[beagle-sdk] send_text ok msgid=") + std::to_string(msgid) + " peer=" + peer);
   return true;
 }
 
