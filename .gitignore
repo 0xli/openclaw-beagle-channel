@@ -6,3 +6,5 @@ dist/
 *.swo
 .env
 .env.local
+sidecar/dist/
+sidecar/node_modules/
