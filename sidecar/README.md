@@ -1,6 +1,38 @@
 # Beagle Chat Carrier Sidecar
 
+# Beagle Chat Carrier Sidecar
+
+⚠️ **Current Status**: This directory contains the complete design and structure for the Carrier sidecar daemon. The Carrier SDK integration and WebSocket event streaming are currently **stub implementations** that need to be completed for production use.
+
 This directory contains the design and implementation for the Carrier sidecar daemon.
+
+## Current Implementation Status
+
+### ✅ Complete
+- HTTP server with REST API endpoints
+- JSON configuration system
+- systemd service integration
+- Command-line argument parsing
+- Graceful shutdown handling
+- Health check endpoint
+- CMake build system
+
+### ⚠️ TODO - Needs Implementation
+1. **Carrier SDK Integration** (`src/carrier_client.cpp`):
+   - Replace stub with real Elastos Carrier SDK calls
+   - Initialize Carrier node with bootstrap nodes
+   - Implement actual message sending via Carrier protocol
+   - Set up Carrier event callbacks for incoming messages
+
+2. **WebSocket Event Streaming** (`src/sidecar_server.cpp`):
+   - Integrate a WebSocket library (uWebSockets or Boost.Beast)
+   - Implement `/events` endpoint with proper WebSocket upgrade
+   - Broadcast incoming Carrier messages to connected WebSocket clients
+
+3. **Testing**:
+   - End-to-end message flow testing
+   - Integration tests with real Carrier network
+   - Load testing for multiple concurrent connections
 
 ## Overview
 

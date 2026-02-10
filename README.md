@@ -142,14 +142,14 @@ Located in `examples/`:
 
 ```
 openclaw-beagle-channel/
-├── src/                    # TypeScript plugin source
+├── src/                    # TypeScript plugin source (✅ Complete)
 │   ├── types.ts           # Type definitions
 │   ├── client.ts          # Sidecar client
 │   ├── provider.ts        # Channel provider
 │   └── index.ts           # Main export
-├── sidecar/               # C++ sidecar daemon
+├── sidecar/               # C++ sidecar daemon (⚠️ Stub implementation)
 │   ├── include/          # Header files
-│   ├── src/              # Implementation
+│   ├── src/              # Implementation (TODO: Carrier SDK integration)
 │   ├── config/           # Default configuration
 │   ├── systemd/          # Service file
 │   ├── CMakeLists.txt    # Build configuration
@@ -163,6 +163,36 @@ openclaw-beagle-channel/
 ├── tsconfig.json          # TypeScript config
 └── README.md             # This file
 ```
+
+## 🚧 Implementation Status
+
+### ✅ Complete
+- TypeScript channel provider plugin
+- HTTP client for sidecar communication
+- WebSocket client for event streaming
+- Type definitions and interfaces
+- Build system and tooling
+- Comprehensive documentation
+- Working examples
+
+### ⚠️ Stub/TODO (Sidecar)
+- **Carrier SDK Integration**: The `CarrierClient` in `sidecar/src/carrier_client.cpp` currently has stub implementations. Real Elastos Carrier SDK calls need to be added.
+- **WebSocket Broadcasting**: The `/events` WebSocket endpoint needs a proper WebSocket library integration (currently returns 501).
+- **Message Reception**: Carrier message callbacks need to be connected to actual SDK events.
+
+### 📋 To Complete Production Implementation
+
+1. **Install Elastos Carrier SDK** on the target system
+2. **Implement Carrier SDK calls** in `carrier_client.cpp`:
+   - Initialize Carrier node
+   - Connect to bootstrap nodes
+   - Send messages via Carrier
+   - Receive messages via callbacks
+3. **Add WebSocket library** (e.g., uWebSockets or Boost.Beast)
+4. **Implement WebSocket broadcast** in `sidecar_server.cpp`
+5. **Test end-to-end** message flow
+
+The architecture, API design, and TypeScript plugin are production-ready. The sidecar provides the correct interface but needs the actual Carrier SDK integration completed.
 
 ## 🔒 Security
 

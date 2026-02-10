@@ -107,21 +107,34 @@ void SidecarServer::handleEvents(const httplib::Request& req, httplib::Response&
         return;
     }
     
-    // Note: This is a simplified stub. In production, implement proper WebSocket handling
-    // using a library like uWebSockets or Boost.Beast
+    // ⚠️ TODO: WebSocket Implementation Required
+    // This stub returns 501 because proper WebSocket support needs:
+    // 1. Integration with a WebSocket library (uWebSockets, Boost.Beast, etc.)
+    // 2. WebSocket protocol upgrade handling
+    // 3. Connection management for multiple clients
+    // 4. Message broadcasting to all connected clients
+    //
+    // Note: cpp-httplib doesn't natively support WebSockets
     
     res.status = 501;
     res.set_content("{\"error\":\"WebSocket endpoint not fully implemented - use dedicated WebSocket library\"}", "application/json");
 }
 
 void SidecarServer::broadcastMessage(const Message& message) {
-    // TODO: Broadcast to all connected WebSocket clients
+    // ⚠️ TODO: WebSocket Broadcasting
+    // This is a stub. In production:
+    // 1. Maintain a list of active WebSocket connections
+    // 2. Serialize message to JSON
+    // 3. Send to all connected clients
+    // 4. Handle disconnections and errors
+    // 5. Implement backpressure handling
+    
     std::lock_guard<std::mutex> lock(wsMutex_);
     
     std::string msgJson = message.toJson().dump();
     
     for (auto& conn : wsConnections_) {
-        // In production: send msgJson to conn.ws
+        // In production: send msgJson to conn.ws using WebSocket library
         std::cout << "[Server] Broadcasting to WS client " << conn.id << ": " << msgJson << std::endl;
     }
 }

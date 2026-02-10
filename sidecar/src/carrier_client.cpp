@@ -10,8 +10,17 @@ extern int64_t getCurrentTimestamp();
 /**
  * Mock/Stub Carrier Client Implementation
  * 
- * This is a placeholder implementation. In production, this would
- * use the actual Elastos Carrier SDK to send/receive messages.
+ * ⚠️ TODO: This is a STUB implementation for the MVP.
+ * 
+ * To complete production implementation:
+ * 1. Link against Elastos Carrier SDK (libelacarrier)
+ * 2. Replace all TODO sections with actual SDK calls
+ * 3. Implement proper error handling
+ * 4. Add connection state management
+ * 5. Test with real Carrier network
+ * 
+ * This placeholder allows the TypeScript plugin and API design
+ * to be tested without requiring the full Carrier SDK setup.
  */
 class CarrierClientImpl : public CarrierClient {
 private:
