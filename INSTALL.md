@@ -159,9 +159,32 @@ This produces:
 
 ---
 
-## Step 4: Install to OpenClaw
+## Step 4: Install Plugin to OpenClaw
 
-### Method A: Automated Install
+The beagle-channel is an OpenClaw plugin. You must install it to the extensions directory for OpenClaw to recognize the "beagle" channel.
+
+### Method A: Manual Install (Plugin Only)
+
+```bash
+cd ~/devs/openclaw-beagle-channel/packages/beagle-channel
+
+# 1. Build (if not already built)
+npm install
+npm run build
+
+# 2. Copy plugin files to OpenClaw extensions
+mkdir -p ~/.openclaw/extensions/beagle
+cp package.json index.js openclaw.plugin.json ~/.openclaw/extensions/beagle/
+cp -r dist ~/.openclaw/extensions/beagle/
+```
+
+**Verify installation:**
+```bash
+ls ~/.openclaw/extensions/beagle/
+# Should show: index.js, openclaw.plugin.json, package.json, dist/
+```
+
+### Method B: Fully Automated (Sidecar + Plugin)
 
 ```bash
 cd ~/devs/openclaw-beagle-channel
