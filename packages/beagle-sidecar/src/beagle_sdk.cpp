@@ -1,6 +1,9 @@
 #include "beagle_sdk.h"
 
 #include <chrono>
+#include <cstdio>
+#include <cctype>
+#include <cstdlib>
 #include <ctime>
 #include <cstring>
 #include <fstream>
@@ -147,6 +150,31 @@ static bool write_file(const std::string& path, const std::string& data) {
   return static_cast<bool>(out);
 }
 
+static std::string json_escape(const std::string& in) {
+  std::string out;
+  out.reserve(in.size() + 8);
+  for (char c : in) {
+    switch (c) {
+      case '\\': out += "\\\\"; break;
+      case '"': out += "\\\""; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if (static_cast<unsigned char>(c) < 0x20) {
+          char buf[7];
+          std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+          out += buf;
+        } else {
+          out += c;
+        }
+    }
+  }
+  return out;
+}
+
+static void ensure_profile_file(RuntimeState* state);
+
 static bool append_line(const std::string& path, const std::string& line) {
   std::ofstream out(path, std::ios::app);
   if (!out) return false;
@@ -211,9 +239,139 @@ static std::string default_profile_json() {
       + "    \"phone\": \"Claw Bot to Help\",\n"
       + "    \"email\": \"SOL:,ETH:\",\n"
       + "    \"description\": \"Ask me anything about beagle chat, Tell me who your are\",\n"
-      + "    \"region\": \"California\"\n"
+      + "    \"region\": \"California\",\n"
+      + "    \"carrierUserId\": \"\",\n"
+      + "    \"carrierAddress\": \"\",\n"
+      + "    \"startedAt\": \"\"\n"
       + "  }\n"
       + "}\n";
+}
+
+static std::string iso8601_utc_now() {
+  std::time_t now = std::time(nullptr);
+  std::tm tm{};
+  gmtime_r(&now, &tm);
+  char buf[32];
+  std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+  return buf;
+}
+
+static bool find_json_object_bounds(const std::string& body,
+                                    const std::string& key,
+                                    size_t& start,
+                                    size_t& end) {
+  std::string needle = "\"" + key + "\"";
+  size_t key_pos = body.find(needle);
+  if (key_pos == std::string::npos) return false;
+  size_t brace = body.find('{', key_pos + needle.size());
+  if (brace == std::string::npos) return false;
+  int depth = 0;
+  for (size_t i = brace; i < body.size(); ++i) {
+    if (body[i] == '{') depth++;
+    else if (body[i] == '}') {
+      depth--;
+      if (depth == 0) {
+        start = brace;
+        end = i;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+static bool replace_json_string_value(std::string& body,
+                                      size_t obj_start,
+                                      size_t obj_end,
+                                      const std::string& key,
+                                      const std::string& value) {
+  std::string needle = "\"" + key + "\"";
+  size_t pos = body.find(needle, obj_start);
+  if (pos == std::string::npos || pos > obj_end) return false;
+  pos = body.find(':', pos + needle.size());
+  if (pos == std::string::npos || pos > obj_end) return false;
+  pos = body.find('"', pos);
+  if (pos == std::string::npos || pos > obj_end) return false;
+  size_t end = body.find('"', pos + 1);
+  if (end == std::string::npos || end > obj_end) return false;
+  body.replace(pos + 1, end - pos - 1, json_escape(value));
+  return true;
+}
+
+static bool insert_json_string_value(std::string& body,
+                                     size_t obj_start,
+                                     size_t obj_end,
+                                     const std::string& key,
+                                     const std::string& value) {
+  size_t pos = obj_end;
+  while (pos > obj_start && std::isspace(static_cast<unsigned char>(body[pos - 1]))) pos--;
+  bool needs_comma = (pos > obj_start + 1 && body[pos - 1] != '{');
+  std::string insert = (needs_comma ? "," : "");
+  insert += "\n    \"" + key + "\": \"" + json_escape(value) + "\"";
+  body.insert(obj_end, insert);
+  return true;
+}
+
+static bool upsert_profile_field(std::string& body,
+                                 const std::string& key,
+                                 const std::string& value,
+                                 bool only_if_missing) {
+  if (value.empty()) return false;
+  size_t obj_start = 0;
+  size_t obj_end = 0;
+  if (!find_json_object_bounds(body, "profile", obj_start, obj_end)) return false;
+  std::string existing;
+  if (extract_json_string(body.substr(obj_start, obj_end - obj_start + 1), key, existing)) {
+    if (existing == value) return false;
+    if (only_if_missing && !existing.empty()) return false;
+    return replace_json_string_value(body, obj_start, obj_end, key, value);
+  }
+  return insert_json_string_value(body, obj_start, obj_end, key, value);
+}
+
+static std::string load_wallet_public_key() {
+  const char* home = std::getenv("HOME");
+  if (!home) return std::string();
+  std::string path = std::string(home) + "/.openclaw/workspace/licode_wallet.json";
+  std::string body;
+  if (!read_file(path, body)) return std::string();
+  std::string pubkey;
+  extract_json_string(body, "publicKey", pubkey);
+  return pubkey;
+}
+
+static void ensure_profile_metadata(RuntimeState* state,
+                                    const std::string& user_id,
+                                    const std::string& address) {
+  if (!state || state->profile_path.empty()) return;
+  ensure_profile_file(state);
+  std::string body;
+  if (!read_file(state->profile_path, body)) return;
+
+  bool changed = false;
+  changed |= upsert_profile_field(body, "carrierUserId", user_id, false);
+  changed |= upsert_profile_field(body, "carrierAddress", address, false);
+
+  std::string started_at;
+  if (!extract_json_string(body, "startedAt", started_at) || started_at.empty()) {
+    changed |= upsert_profile_field(body, "startedAt", iso8601_utc_now(), true);
+  }
+
+  std::string email;
+  extract_json_string(body, "email", email);
+  std::string wallet = load_wallet_public_key();
+  if (!wallet.empty()) {
+    bool placeholder = email.empty()
+        || email.find("SOL:") != std::string::npos
+        || email.find("ETH:") != std::string::npos;
+    if (placeholder && email != wallet) {
+      changed |= upsert_profile_field(body, "email", wallet, false);
+    }
+  }
+
+  if (changed) {
+    write_file(state->profile_path, body);
+  }
 }
 
 static std::string default_db_json() {
@@ -876,6 +1034,8 @@ bool BeagleSdk::start(const BeagleSdkOptions& options, BeagleIncomingCallback on
   log_line(std::string("[beagle-sdk] User ID: ") + user_id_);
   log_line(std::string("[beagle-sdk] Address: ") + address_);
 
+  ensure_profile_metadata(&g_state, g_state.user_id, g_state.address);
+
   ProfileInfo profile;
   load_profile(&g_state, profile);
   load_welcomed_peers(&g_state);
@@ -951,9 +1111,11 @@ bool BeagleSdk::send_media(const std::string& peer,
   return send_text(peer, payload);
 }
 
+#if !BEAGLE_SDK_STUB
 BeagleStatus BeagleSdk::status() const {
   std::lock_guard<std::mutex> lock(g_state.state_mu);
   return g_state.status;
 }
+#endif
 
 #endif
