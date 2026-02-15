@@ -1,5 +1,12 @@
 import { createSidecarClient, type BeagleAccount } from "./sidecarClient.js";
 
+function normalizePeerId(value: any) {
+  return String(value ?? "")
+    .replace(/^beagle:\/\//i, "")
+    .replace(/^beagle:/i, "")
+    .trim();
+}
+
 // OpenClaw plugin entrypoint. Types are intentionally loose to avoid
 // coupling to a specific SDK version.
 export default function register(api: any) {
@@ -28,14 +35,14 @@ export default function register(api: any) {
       sendText: async ({ cfg, accountId, chatId, text }: any) => {
         const account = resolveAccount(cfg, accountId);
         const client = createSidecarClient(account);
-        await client.sendText({ peer: chatId, text });
+        await client.sendText({ peer: normalizePeerId(chatId), text });
         return { ok: true };
       },
       sendMedia: async ({ cfg, accountId, chatId, caption, mediaPath, mediaUrl, mediaType, filename }: any) => {
         const account = resolveAccount(cfg, accountId);
         const client = createSidecarClient(account);
         await client.sendMedia({
-          peer: chatId,
+          peer: normalizePeerId(chatId),
           caption,
           mediaPath,
           mediaUrl,
@@ -121,23 +128,30 @@ async function handleInboundEvent(api: any, accountId: string, account: BeagleAc
     }
 
     const rawBody = ev?.text ?? "";
+    const inboundMediaUrl = ev?.mediaUrl ?? "";
+    const inboundMediaPath = ev?.mediaPath ?? "";
+    const inboundMediaType = ev?.mediaType ?? "";
+    const inboundFilename = ev?.filename ?? "";
+    const inboundSize = ev?.size ?? 0;
+    const hasInboundMedia = Boolean(inboundMediaUrl || inboundMediaPath);
     const rawTs = ev?.ts ?? 0;
     const normalizedTs = rawTs > 10_000_000_000_000 ? Math.floor(rawTs / 1000) : rawTs;
     const timestamp = normalizedTs || Date.now();
     const dispatchStart = Date.now();
 
     const peerId = String(ev?.peer ?? "");
+    const normalizedPeerId = normalizePeerId(peerId);
     const route = core.channel.routing.resolveAgentRoute({
       cfg: api?.config ?? {},
       channel: "beagle",
       accountId,
       peer: {
         kind: "dm",
-        id: peerId
+        id: normalizedPeerId
       }
     });
 
-    const sessionKey = `beagle:${accountId}:${peerId}`;
+    const sessionKey = `beagle:${accountId}:${normalizedPeerId}`;
 
     const storePath = core.channel.session.resolveStorePath(api?.config?.session?.store, {
       agentId: route.agentId
@@ -146,16 +160,27 @@ async function handleInboundEvent(api: any, accountId: string, account: BeagleAc
       storePath,
       sessionKey
     });
-    const body = rawBody;
+    const mediaHint = hasInboundMedia
+      ? `Image attached${inboundFilename ? `: ${inboundFilename}` : ""}.`
+      : "";
+    const body = rawBody || mediaHint;
 
     const ctxPayload = core.channel.reply.finalizeInboundContext({
       Body: body,
       BodyForAgent: body,
-      BodyForCommands: rawBody,
-      RawBody: rawBody,
-      CommandBody: rawBody,
+      BodyForCommands: rawBody || body,
+      RawBody: rawBody || body,
+      CommandBody: rawBody || body,
+      MediaUrl: inboundMediaUrl,
+      MediaPath: inboundMediaPath,
+      MediaType: inboundMediaType,
+      MediaUrls: inboundMediaUrl ? [inboundMediaUrl] : undefined,
+      MediaPaths: inboundMediaPath ? [inboundMediaPath] : undefined,
+      MediaTypes: inboundMediaType ? [inboundMediaType] : undefined,
+      Filename: inboundFilename,
+      MediaSize: inboundSize,
       From: `beagle:${peerId}`,
-      To: `beagle:${peerId}`,
+      To: normalizedPeerId,
       SessionKey: sessionKey,
       AccountId: route.accountId,
       ChatType: "direct",
@@ -166,10 +191,12 @@ async function handleInboundEvent(api: any, accountId: string, account: BeagleAc
       MessageSid: ev?.msgId,
       Timestamp: timestamp,
       OriginatingChannel: "beagle",
-      OriginatingTo: `beagle:${peerId}`
+      OriginatingTo: normalizedPeerId
     });
 
-    api?.logger?.info?.(`[beagle] route agent=${route.agentId} session=${sessionKey}`);
+    api?.logger?.info?.(
+      `[beagle] route agent=${route.agentId} session=${sessionKey} media_path=${inboundMediaPath || "(none)"} media_type=${inboundMediaType || "(none)"}`
+    );
     await core.channel.session.recordInboundSession({
       storePath,
       sessionKey,
@@ -189,18 +216,24 @@ async function handleInboundEvent(api: any, accountId: string, account: BeagleAc
           const text = payload?.text ?? "";
           api?.logger?.info?.(`[beagle] deliver kind=${payload?.kind ?? "unknown"} text_len=${text.length}`);
           const mediaUrl = payload?.mediaUrl || (Array.isArray(payload?.mediaUrls) ? payload.mediaUrls[0] : "");
-          if (mediaUrl) {
+          const mediaPath = payload?.mediaPath || payload?.filePath || payload?.attachmentPath || "";
+          const mediaType = payload?.mediaType || payload?.mimeType || payload?.mimetype || "";
+          const filename = payload?.filename || payload?.fileName || "";
+          if (mediaUrl || mediaPath) {
             api?.logger?.info?.("[beagle] sendMedia");
             await client.sendMedia({
-              peer: peerId,
+              peer: normalizedPeerId,
               caption: text,
-              mediaUrl
+              mediaUrl,
+              mediaPath,
+              mediaType,
+              filename
             });
             return;
           }
           if (text) {
             api?.logger?.info?.("[beagle] sendText");
-            await client.sendText({ peer: peerId, text });
+            await client.sendText({ peer: normalizedPeerId, text });
           }
         },
         onError: (err: any, info: any) => {

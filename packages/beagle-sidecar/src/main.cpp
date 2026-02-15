@@ -22,6 +22,7 @@ struct Event {
   std::string media_path;
   std::string media_type;
   std::string filename;
+  unsigned long long size = 0;
   std::string msg_id;
   long long ts = 0;
 };
@@ -42,6 +43,61 @@ static void log_line(const std::string& msg) {
 static std::mutex g_events_mu;
 static std::vector<Event> g_events;
 
+static bool decode_json_string(const std::string& body, size_t start, std::string& out, size_t& end_pos) {
+  if (start >= body.size() || body[start] != '"') return false;
+  out.clear();
+  for (size_t i = start + 1; i < body.size(); ++i) {
+    char c = body[i];
+    if (c == '"') {
+      end_pos = i;
+      return true;
+    }
+    if (c != '\\') {
+      out.push_back(c);
+      continue;
+    }
+    if (i + 1 >= body.size()) return false;
+    char esc = body[++i];
+    switch (esc) {
+      case '"': out.push_back('"'); break;
+      case '\\': out.push_back('\\'); break;
+      case '/': out.push_back('/'); break;
+      case 'b': out.push_back('\b'); break;
+      case 'f': out.push_back('\f'); break;
+      case 'n': out.push_back('\n'); break;
+      case 'r': out.push_back('\r'); break;
+      case 't': out.push_back('\t'); break;
+      case 'u': {
+        if (i + 4 >= body.size()) return false;
+        int code = 0;
+        for (int k = 0; k < 4; ++k) {
+          char h = body[i + 1 + k];
+          code <<= 4;
+          if (h >= '0' && h <= '9') code |= (h - '0');
+          else if (h >= 'a' && h <= 'f') code |= (h - 'a' + 10);
+          else if (h >= 'A' && h <= 'F') code |= (h - 'A' + 10);
+          else return false;
+        }
+        i += 4;
+        if (code <= 0x7F) {
+          out.push_back(static_cast<char>(code));
+        } else if (code <= 0x7FF) {
+          out.push_back(static_cast<char>(0xC0 | ((code >> 6) & 0x1F)));
+          out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+        } else {
+          out.push_back(static_cast<char>(0xE0 | ((code >> 12) & 0x0F)));
+          out.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
+          out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+        }
+        break;
+      }
+      default:
+        return false;
+    }
+  }
+  return false;
+}
+
 static bool extract_json_string(const std::string& body, const std::string& key, std::string& out) {
   std::string needle = "\"" + key + "\"";
   size_t pos = body.find(needle);
@@ -50,10 +106,8 @@ static bool extract_json_string(const std::string& body, const std::string& key,
   if (pos == std::string::npos) return false;
   pos = body.find('"', pos);
   if (pos == std::string::npos) return false;
-  size_t end = body.find('"', pos + 1);
-  if (end == std::string::npos) return false;
-  out = body.substr(pos + 1, end - pos - 1);
-  return true;
+  size_t end_pos = pos;
+  return decode_json_string(body, pos, out, end_pos);
 }
 
 static std::string json_escape(const std::string& in) {
@@ -93,6 +147,7 @@ static std::string events_to_json(std::vector<Event> events) {
     if (!ev.media_path.empty()) oss << ",\"mediaPath\":\"" << json_escape(ev.media_path) << "\"";
     if (!ev.media_type.empty()) oss << ",\"mediaType\":\"" << json_escape(ev.media_type) << "\"";
     if (!ev.filename.empty()) oss << ",\"filename\":\"" << json_escape(ev.filename) << "\"";
+    if (ev.size > 0) oss << ",\"size\":" << ev.size;
     if (!ev.msg_id.empty()) oss << ",\"msgId\":\"" << json_escape(ev.msg_id) << "\"";
     if (ev.ts != 0) oss << ",\"ts\":" << ev.ts;
     oss << "}";
@@ -176,6 +231,7 @@ static void push_event(const BeagleIncomingMessage& msg) {
   ev.media_url = msg.media_url;
   ev.media_type = msg.media_type;
   ev.filename = msg.filename;
+  ev.size = msg.size;
   ev.msg_id = msg.msg_id;
   ev.ts = msg.ts;
 

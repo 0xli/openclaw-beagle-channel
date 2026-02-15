@@ -45,6 +45,8 @@ if(NOT BEAGLE_SDK_STUB)
 
   target_include_directories(beagle-sidecar PRIVATE
     ${BEAGLE_SDK_ROOT}/src/carrier
+    ${BEAGLE_SDK_ROOT}/src/session
+    ${BEAGLE_SDK_ROOT}/src/filetransfer
     ${BEAGLE_SDK_ROOT}/config
     ${BEAGLE_SDK_INTERMEDIATE_DIR}/include
   )
@@ -54,11 +56,11 @@ if(NOT BEAGLE_SDK_STUB)
     ${BEAGLE_SDK_INTERMEDIATE_DIR}/lib
   )
 
-  target_link_libraries(beagle-sidecar PRIVATE carrier config crystal)
+  target_link_libraries(beagle-sidecar PRIVATE carrier carriersession carrierfiletrans config crystal)
 
   set_target_properties(beagle-sidecar PROPERTIES
-    BUILD_RPATH "${BEAGLE_SDK_BUILD_DIR}/src/carrier;${BEAGLE_SDK_INTERMEDIATE_DIR}/lib"
-    INSTALL_RPATH "${BEAGLE_SDK_BUILD_DIR}/src/carrier;${BEAGLE_SDK_INTERMEDIATE_DIR}/lib"
+    BUILD_RPATH "${BEAGLE_SDK_BUILD_DIR}/src/carrier;${BEAGLE_SDK_BUILD_DIR}/src/session;${BEAGLE_SDK_BUILD_DIR}/src/filetransfer;${BEAGLE_SDK_INTERMEDIATE_DIR}/lib"
+    INSTALL_RPATH "${BEAGLE_SDK_BUILD_DIR}/src/carrier;${BEAGLE_SDK_BUILD_DIR}/src/session;${BEAGLE_SDK_BUILD_DIR}/src/filetransfer;${BEAGLE_SDK_INTERMEDIATE_DIR}/lib"
   )
 else()
   target_compile_definitions(beagle-sidecar PRIVATE BEAGLE_SDK_STUB=1)

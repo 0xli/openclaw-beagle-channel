@@ -36,6 +36,37 @@ You can also use the helper script:
 
 `--token` is optional. If you set it, OpenClaw must send the same bearer token.
 
+## Run In Background (systemd user service)
+
+The scripts can auto-detect `BEAGLE_SDK_ROOT` from `build/CMakeCache.txt` if you already built.
+Otherwise, export it first.
+
+Install and start:
+
+```bash
+export BEAGLE_SDK_ROOT=/path/to/Elastos.NET.Carrier.Native.SDK
+./start.sh --install-systemd-user
+```
+
+Status and logs:
+
+```bash
+./start.sh --status-systemd-user
+scripts/setup-systemd-user.sh logs
+```
+
+Uninstall:
+
+```bash
+./start.sh --uninstall-systemd-user
+```
+
+To keep it running after logout, you may need:
+
+```bash
+loginctl enable-linger "$USER"
+```
+
 ## Profile + Welcome Config
 
 When you pass `--data-dir`, the sidecar will create:

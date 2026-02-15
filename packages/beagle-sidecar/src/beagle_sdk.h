@@ -10,6 +10,7 @@ struct BeagleIncomingMessage {
   std::string media_url;
   std::string media_type;
   std::string filename;
+  unsigned long long size = 0;
   std::string msg_id;
   long long ts = 0;
 };

@@ -3,12 +3,14 @@
 #include <chrono>
 #include <cstdio>
 #include <cctype>
+#include <cstdint>
 #include <cstdlib>
 #include <ctime>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <sys/stat.h>
@@ -62,9 +64,13 @@ BeagleStatus BeagleSdk::status() const {
 extern "C" {
 #include <carrier.h>
 #include <carrier_config.h>
+#include <carrier_session.h>
+#include <carrier_filetransfer.h>
 }
 
 namespace {
+constexpr size_t kMaxBeaglechatFileBytes = 5 * 1024 * 1024;
+
 static std::string log_ts() {
   std::time_t now = std::time(nullptr);
   std::tm tm_buf{};
@@ -121,6 +127,7 @@ struct RuntimeState {
   std::string db_config_path;
   std::string friend_state_path;
   std::string friend_event_log_path;
+  std::string media_dir;
   std::string user_id;
   std::string address;
   BeagleStatus status;
@@ -128,6 +135,28 @@ struct RuntimeState {
   std::map<std::string, FriendState> friend_state;
   DbConfig db;
 };
+
+struct TransferContext {
+  RuntimeState* state = nullptr;
+  CarrierFileTransfer* ft = nullptr;
+  bool is_sender = false;
+  bool connected = false;
+  bool completed = false;
+  std::string peer;
+  std::string fileid;
+  std::string filename;
+  std::string media_type;
+  std::string caption;
+  std::string source_path;
+  std::string target_path;
+  uint64_t expected_size = 0;
+  uint64_t transferred = 0;
+  std::ifstream source;
+  std::ofstream target;
+};
+
+static std::mutex g_ft_mu;
+static std::map<CarrierFileTransfer*, std::shared_ptr<TransferContext>> g_transfers;
 
 static bool file_exists(const std::string& path) {
   std::ifstream f(path);
@@ -139,6 +168,313 @@ static void ensure_dir(const std::string& path) {
   struct stat st;
   if (stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) return;
   mkdir(path.c_str(), 0755);
+}
+
+static unsigned long long file_size_bytes(const std::string& path) {
+  struct stat st;
+  if (stat(path.c_str(), &st) != 0) return 0;
+  if (!S_ISREG(st.st_mode)) return 0;
+  return static_cast<unsigned long long>(st.st_size);
+}
+
+static std::string basename_of(const std::string& path) {
+  size_t pos = path.find_last_of("/\\");
+  if (pos == std::string::npos) return path;
+  return path.substr(pos + 1);
+}
+
+static std::string sanitize_filename(const std::string& name) {
+  std::string out;
+  out.reserve(name.size());
+  for (char c : name) {
+    if (c == '/' || c == '\\' || c == '\0') {
+      out.push_back('_');
+    } else {
+      out.push_back(c);
+    }
+  }
+  if (out.empty()) return "file.bin";
+  return out;
+}
+
+static std::string lowercase(std::string s) {
+  for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return s;
+}
+
+static std::string infer_media_type_from_filename(const std::string& filename) {
+  std::string lower = lowercase(filename);
+  if (lower.size() >= 4 && lower.rfind(".jpg") == lower.size() - 4) return "image/jpeg";
+  if (lower.size() >= 5 && lower.rfind(".jpeg") == lower.size() - 5) return "image/jpeg";
+  if (lower.size() >= 4 && lower.rfind(".png") == lower.size() - 4) return "image/png";
+  if (lower.size() >= 4 && lower.rfind(".gif") == lower.size() - 4) return "image/gif";
+  if (lower.size() >= 5 && lower.rfind(".webp") == lower.size() - 5) return "image/webp";
+  if (lower.size() >= 4 && lower.rfind(".mp4") == lower.size() - 4) return "video/mp4";
+  if (lower.size() >= 4 && lower.rfind(".mp3") == lower.size() - 4) return "audio/mpeg";
+  if (lower.size() >= 4 && lower.rfind(".wav") == lower.size() - 4) return "audio/wav";
+  if (lower.size() >= 4 && lower.rfind(".pdf") == lower.size() - 4) return "application/pdf";
+  return "application/octet-stream";
+}
+
+static std::string json_quote(const std::string& in) {
+  std::string out;
+  out.reserve(in.size() + 2);
+  out.push_back('"');
+  for (char c : in) {
+    switch (c) {
+      case '\\': out += "\\\\"; break;
+      case '"': out += "\\\""; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if (static_cast<unsigned char>(c) < 0x20) {
+          char buf[7];
+          std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+          out += buf;
+        } else {
+          out.push_back(c);
+        }
+    }
+  }
+  out.push_back('"');
+  return out;
+}
+
+static bool read_file_binary(const std::string& path, std::vector<unsigned char>& out) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return false;
+  in.seekg(0, std::ios::end);
+  std::streamoff len = in.tellg();
+  if (len <= 0) return false;
+  in.seekg(0, std::ios::beg);
+  out.resize(static_cast<size_t>(len));
+  in.read(reinterpret_cast<char*>(out.data()), len);
+  return static_cast<bool>(in);
+}
+
+static bool parse_json_string_field(const std::string& json,
+                                    const std::string& key,
+                                    std::string& value) {
+  std::string marker = "\"" + key + "\"";
+  size_t pos = json.find(marker);
+  if (pos == std::string::npos) return false;
+  pos = json.find(':', pos + marker.size());
+  if (pos == std::string::npos) return false;
+  while (++pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos]))) {}
+  if (pos >= json.size() || json[pos] != '"') return false;
+
+  std::string out;
+  bool escaped = false;
+  for (++pos; pos < json.size(); ++pos) {
+    char c = json[pos];
+    if (escaped) {
+      switch (c) {
+        case '"': out.push_back('"'); break;
+        case '\\': out.push_back('\\'); break;
+        case '/': out.push_back('/'); break;
+        case 'b': out.push_back('\b'); break;
+        case 'f': out.push_back('\f'); break;
+        case 'n': out.push_back('\n'); break;
+        case 'r': out.push_back('\r'); break;
+        case 't': out.push_back('\t'); break;
+        default: out.push_back(c); break;
+      }
+      escaped = false;
+      continue;
+    }
+    if (c == '\\') {
+      escaped = true;
+      continue;
+    }
+    if (c == '"') {
+      value = out;
+      return true;
+    }
+    out.push_back(c);
+  }
+  return false;
+}
+
+static bool parse_json_u64_field(const std::string& json,
+                                 const std::string& key,
+                                 uint64_t& value) {
+  std::string marker = "\"" + key + "\"";
+  size_t pos = json.find(marker);
+  if (pos == std::string::npos) return false;
+  pos = json.find(':', pos + marker.size());
+  if (pos == std::string::npos) return false;
+  while (++pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos]))) {}
+  if (pos >= json.size() || !std::isdigit(static_cast<unsigned char>(json[pos]))) return false;
+  uint64_t out = 0;
+  for (; pos < json.size() && std::isdigit(static_cast<unsigned char>(json[pos])); ++pos) {
+    out = out * 10 + static_cast<uint64_t>(json[pos] - '0');
+  }
+  value = out;
+  return true;
+}
+
+struct PackedFilePayload {
+  std::string filename;
+  std::string content_type;
+  uint64_t declared_size = 0;
+  const unsigned char* bytes = nullptr;
+  size_t bytes_len = 0;
+};
+
+static int b64_value(unsigned char c) {
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+  if (c >= '0' && c <= '9') return c - '0' + 52;
+  if (c == '+') return 62;
+  if (c == '/') return 63;
+  return -1;
+}
+
+static bool base64_decode(const std::string& in, std::vector<unsigned char>& out) {
+  out.clear();
+  out.reserve((in.size() * 3) / 4);
+  int val = 0;
+  int valb = -8;
+  for (unsigned char c : in) {
+    if (std::isspace(c)) continue;
+    if (c == '=') break;
+    int d = b64_value(c);
+    if (d < 0) return false;
+    val = (val << 6) + d;
+    valb += 6;
+    if (valb >= 0) {
+      out.push_back(static_cast<unsigned char>((val >> valb) & 0xFF));
+      valb -= 8;
+    }
+  }
+  return !out.empty();
+}
+
+struct InlineJsonMedia {
+  std::string filename;
+  std::string media_type;
+  std::vector<unsigned char> bytes;
+};
+
+static std::string trim_data_url_prefix(const std::string& data) {
+  size_t comma = data.find(',');
+  if (comma == std::string::npos) return data;
+  std::string prefix = lowercase(data.substr(0, comma));
+  if (prefix.find("base64") != std::string::npos) return data.substr(comma + 1);
+  return data;
+}
+
+static bool has_file_extension(const std::string& filename) {
+  size_t slash = filename.find_last_of("/\\");
+  size_t dot = filename.find_last_of('.');
+  return dot != std::string::npos && (slash == std::string::npos || dot > slash + 1);
+}
+
+static bool decode_inline_json_media_payload(const void* msg, size_t len, InlineJsonMedia& out) {
+  if (!msg || len < 8 || len > (kMaxBeaglechatFileBytes * 2)) return false;
+  std::string body(static_cast<const char*>(msg), len);
+  while (!body.empty() && (body.back() == '\0' || std::isspace(static_cast<unsigned char>(body.back())))) {
+    body.pop_back();
+  }
+  size_t start = 0;
+  while (start < body.size() && std::isspace(static_cast<unsigned char>(body[start]))) start++;
+  if (start > 0) body.erase(0, start);
+  if (body.empty() || body.front() != '{' || body.back() != '}') return false;
+
+  std::string type;
+  if (!parse_json_string_field(body, "type", type)) return false;
+  type = lowercase(type);
+  if (type != "image" && type != "file") return false;
+
+  std::string data;
+  if (!parse_json_string_field(body, "data", data) || data.empty()) return false;
+
+  std::string filename;
+  parse_json_string_field(body, "fileName", filename);
+  if (filename.empty()) parse_json_string_field(body, "filename", filename);
+  std::string ext;
+  parse_json_string_field(body, "fileExtension", ext);
+  if (!ext.empty() && ext[0] != '.') ext = "." + ext;
+  if (!filename.empty() && !ext.empty() && !has_file_extension(filename)) filename += ext;
+  if (filename.empty()) {
+    filename = (type == "image" ? "image" : "file");
+    if (!ext.empty()) filename += ext;
+  }
+  filename = sanitize_filename(filename);
+
+  std::string media_type;
+  if (!parse_json_string_field(body, "mediaType", media_type) || media_type.empty()) {
+    media_type = infer_media_type_from_filename(filename);
+  }
+
+  std::vector<unsigned char> decoded;
+  std::string b64 = trim_data_url_prefix(data);
+  if (!base64_decode(b64, decoded)) return false;
+  if (decoded.size() > kMaxBeaglechatFileBytes) return false;
+
+  out.filename = filename;
+  out.media_type = media_type;
+  out.bytes.swap(decoded);
+  return true;
+}
+
+static bool decode_beaglechat_file_payload(const void* msg, size_t len, PackedFilePayload& out) {
+  if (!msg || len < 5) return false;
+  const unsigned char* p = static_cast<const unsigned char*>(msg);
+  uint32_t meta_len = (static_cast<uint32_t>(p[0]) << 24)
+                    | (static_cast<uint32_t>(p[1]) << 16)
+                    | (static_cast<uint32_t>(p[2]) << 8)
+                    | static_cast<uint32_t>(p[3]);
+  if (meta_len == 0 || meta_len > 4096) return false;
+  if (static_cast<size_t>(meta_len) + 4 > len) return false;
+
+  std::string meta(reinterpret_cast<const char*>(p + 4), meta_len);
+  std::string type;
+  if (!parse_json_string_field(meta, "type", type) || type != "file") return false;
+
+  std::string filename;
+  if (!parse_json_string_field(meta, "filename", filename) || filename.empty()) return false;
+
+  std::string content_type;
+  if (!parse_json_string_field(meta, "contentType", content_type) || content_type.empty()) {
+    content_type = infer_media_type_from_filename(filename);
+  }
+
+  uint64_t declared_size = 0;
+  parse_json_u64_field(meta, "size", declared_size);
+
+  out.filename = sanitize_filename(filename);
+  out.content_type = content_type;
+  out.declared_size = declared_size;
+  out.bytes = p + 4 + meta_len;
+  out.bytes_len = len - 4 - meta_len;
+  return true;
+}
+
+static bool encode_beaglechat_file_payload(const std::string& filename,
+                                           const std::string& content_type,
+                                           const std::vector<unsigned char>& data,
+                                           std::vector<unsigned char>& out) {
+  std::ostringstream meta;
+  meta << "{"
+       << "\"type\":\"file\","
+       << "\"filename\":" << json_quote(filename) << ","
+       << "\"contentType\":" << json_quote(content_type.empty() ? "application/octet-stream" : content_type) << ","
+       << "\"size\":" << data.size()
+       << "}";
+  std::string meta_json = meta.str();
+  if (meta_json.empty() || meta_json.size() > 4096) return false;
+
+  uint32_t meta_len = static_cast<uint32_t>(meta_json.size());
+  out.resize(4 + meta_len + data.size());
+  out[0] = static_cast<unsigned char>((meta_len >> 24) & 0xFF);
+  out[1] = static_cast<unsigned char>((meta_len >> 16) & 0xFF);
+  out[2] = static_cast<unsigned char>((meta_len >> 8) & 0xFF);
+  out[3] = static_cast<unsigned char>(meta_len & 0xFF);
+  std::memcpy(out.data() + 4, meta_json.data(), meta_json.size());
+  if (!data.empty()) std::memcpy(out.data() + 4 + meta_json.size(), data.data(), data.size());
+  return true;
 }
 
 static bool read_file(const std::string& path, std::string& out) {
@@ -797,6 +1133,250 @@ static void send_welcome_once(RuntimeState* state, const std::string& peer, cons
   }
 }
 
+static void register_transfer(const std::shared_ptr<TransferContext>& ctx) {
+  if (!ctx || !ctx->ft) return;
+  std::lock_guard<std::mutex> lock(g_ft_mu);
+  g_transfers[ctx->ft] = ctx;
+}
+
+static std::shared_ptr<TransferContext> get_transfer(CarrierFileTransfer* ft) {
+  if (!ft) return nullptr;
+  std::lock_guard<std::mutex> lock(g_ft_mu);
+  auto it = g_transfers.find(ft);
+  if (it == g_transfers.end()) return nullptr;
+  return it->second;
+}
+
+static std::shared_ptr<TransferContext> take_transfer(CarrierFileTransfer* ft) {
+  if (!ft) return nullptr;
+  std::lock_guard<std::mutex> lock(g_ft_mu);
+  auto it = g_transfers.find(ft);
+  if (it == g_transfers.end()) return nullptr;
+  auto ctx = it->second;
+  g_transfers.erase(it);
+  return ctx;
+}
+
+static void emit_incoming_file_event(const std::shared_ptr<TransferContext>& ctx) {
+  if (!ctx || !ctx->state || !ctx->state->on_incoming) return;
+  BeagleIncomingMessage incoming;
+  incoming.peer = ctx->peer;
+  incoming.text = "";
+  incoming.media_path = ctx->target_path;
+  incoming.media_type = ctx->media_type;
+  incoming.filename = ctx->filename;
+  incoming.size = static_cast<unsigned long long>(ctx->transferred);
+  incoming.ts = static_cast<long long>(std::time(nullptr));
+  ctx->state->on_incoming(incoming);
+
+  std::ostringstream line;
+  line << "[beagle-sdk] received file from " << ctx->peer
+       << " file=" << ctx->filename
+       << " size=" << ctx->transferred
+       << " path=" << ctx->target_path;
+  log_line(line.str());
+}
+
+static void filetransfer_state_changed_callback(CarrierFileTransfer* ft,
+                                                FileTransferConnection state,
+                                                void* context) {
+  (void)context;
+  auto ctx = get_transfer(ft);
+  if (!ctx) return;
+  ctx->connected = (state == FileTransferConnection_connected);
+
+  if (state == FileTransferConnection_connected && !ctx->is_sender && !ctx->fileid.empty()) {
+    carrier_filetransfer_pull(ft, ctx->fileid.c_str(), 0);
+  }
+
+  if (state == FileTransferConnection_closed || state == FileTransferConnection_failed) {
+    auto done = take_transfer(ft);
+    if (!done) return;
+    if (done->source.is_open()) done->source.close();
+    if (done->target.is_open()) done->target.close();
+    carrier_filetransfer_close(ft);
+  }
+}
+
+static void filetransfer_file_callback(CarrierFileTransfer* ft,
+                                       const char* fileid,
+                                       const char* filename,
+                                       uint64_t size,
+                                       void* context) {
+  (void)context;
+  auto ctx = get_transfer(ft);
+  if (!ctx) return;
+  if (fileid && *fileid) ctx->fileid = fileid;
+  if (filename && *filename) ctx->filename = sanitize_filename(filename);
+  if (size > 0) ctx->expected_size = size;
+  if (ctx->media_type.empty()) ctx->media_type = infer_media_type_from_filename(ctx->filename);
+  if (!ctx->is_sender && ctx->connected && !ctx->fileid.empty()) {
+    carrier_filetransfer_pull(ft, ctx->fileid.c_str(), 0);
+  }
+}
+
+static void filetransfer_pull_callback(CarrierFileTransfer* ft,
+                                       const char* fileid,
+                                       uint64_t offset,
+                                       void* context) {
+  (void)context;
+  auto ctx = get_transfer(ft);
+  if (!ctx || !ctx->is_sender) return;
+  if (!fileid || ctx->fileid != fileid) return;
+
+  if (!ctx->source.is_open()) {
+    ctx->source.open(ctx->source_path, std::ios::binary);
+    if (!ctx->source) {
+      carrier_filetransfer_cancel(ft, ctx->fileid.c_str(), -1, "open source failed");
+      return;
+    }
+  }
+  ctx->source.clear();
+  ctx->source.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+  if (!ctx->source.good()) {
+    carrier_filetransfer_cancel(ft, ctx->fileid.c_str(), -1, "seek source failed");
+    return;
+  }
+
+  char buf[64 * 1024];
+  while (ctx->source.good()) {
+    ctx->source.read(buf, sizeof(buf));
+    std::streamsize got = ctx->source.gcount();
+    if (got <= 0) break;
+    ssize_t sent = carrier_filetransfer_send(ft,
+                                             ctx->fileid.c_str(),
+                                             reinterpret_cast<const uint8_t*>(buf),
+                                             static_cast<size_t>(got));
+    if (sent < 0) {
+      carrier_filetransfer_cancel(ft, ctx->fileid.c_str(), -1, "send chunk failed");
+      return;
+    }
+    ctx->transferred += static_cast<uint64_t>(sent);
+  }
+
+  carrier_filetransfer_send(ft, ctx->fileid.c_str(), nullptr, 0);
+}
+
+static bool filetransfer_data_callback(CarrierFileTransfer* ft,
+                                       const char* fileid,
+                                       const uint8_t* data,
+                                       size_t length,
+                                       void* context) {
+  (void)context;
+  auto ctx = get_transfer(ft);
+  if (!ctx || ctx->is_sender) return false;
+  if (!fileid || ctx->fileid != fileid) return false;
+  if (!ctx->target.is_open()) return false;
+
+  if (length == 0) {
+    ctx->target.flush();
+    ctx->target.close();
+    ctx->completed = true;
+    emit_incoming_file_event(ctx);
+    return false;
+  }
+
+  ctx->target.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(length));
+  if (!ctx->target.good()) return false;
+  ctx->transferred += static_cast<uint64_t>(length);
+  return true;
+}
+
+static void filetransfer_pending_callback(CarrierFileTransfer* ft,
+                                          const char* fileid,
+                                          void* context) {
+  (void)ft;
+  (void)fileid;
+  (void)context;
+}
+
+static void filetransfer_resume_callback(CarrierFileTransfer* ft,
+                                         const char* fileid,
+                                         void* context) {
+  (void)ft;
+  (void)fileid;
+  (void)context;
+}
+
+static void filetransfer_cancel_callback(CarrierFileTransfer* ft,
+                                         const char* fileid,
+                                         int status,
+                                         const char* reason,
+                                         void* context) {
+  (void)fileid;
+  (void)context;
+  std::ostringstream msg;
+  msg << "[beagle-sdk] file transfer canceled status=" << status
+      << " reason=" << (reason ? reason : "");
+  log_line(msg.str());
+  auto ctx = take_transfer(ft);
+  if (!ctx) return;
+  if (ctx->source.is_open()) ctx->source.close();
+  if (ctx->target.is_open()) ctx->target.close();
+  carrier_filetransfer_close(ft);
+}
+
+static CarrierFileTransferCallbacks build_filetransfer_callbacks() {
+  CarrierFileTransferCallbacks cbs;
+  std::memset(&cbs, 0, sizeof(cbs));
+  cbs.state_changed = filetransfer_state_changed_callback;
+  cbs.file = filetransfer_file_callback;
+  cbs.pull = filetransfer_pull_callback;
+  cbs.data = filetransfer_data_callback;
+  cbs.pending = filetransfer_pending_callback;
+  cbs.resume = filetransfer_resume_callback;
+  cbs.cancel = filetransfer_cancel_callback;
+  return cbs;
+}
+
+static void filetransfer_connect_callback(Carrier* carrier,
+                                          const char* address,
+                                          const CarrierFileTransferInfo* fileinfo,
+                                          void* context) {
+  auto* state = static_cast<RuntimeState*>(context);
+  if (!state || !carrier || !address || !fileinfo) return;
+
+  auto ctx = std::make_shared<TransferContext>();
+  ctx->state = state;
+  ctx->is_sender = false;
+  ctx->peer = address;
+  ctx->fileid = fileinfo->fileid;
+  ctx->filename = sanitize_filename(fileinfo->filename);
+  ctx->expected_size = fileinfo->size;
+  ctx->media_type = infer_media_type_from_filename(ctx->filename);
+
+  ensure_dir(state->media_dir);
+  std::ostringstream path;
+  path << state->media_dir << "/" << std::time(nullptr) << "_" << ctx->filename;
+  ctx->target_path = path.str();
+  ctx->target.open(ctx->target_path, std::ios::binary | std::ios::trunc);
+  if (!ctx->target) {
+    log_line(std::string("[beagle-sdk] failed to open target file: ") + ctx->target_path);
+    return;
+  }
+
+  CarrierFileTransferCallbacks cbs = build_filetransfer_callbacks();
+  ctx->ft = carrier_filetransfer_new(carrier, address, fileinfo, &cbs, ctx.get());
+  if (!ctx->ft) {
+    std::ostringstream msg;
+    msg << "[beagle-sdk] carrier_filetransfer_new(receiver) failed: 0x" << std::hex
+        << carrier_get_error() << std::dec;
+    log_line(msg.str());
+    ctx->target.close();
+    return;
+  }
+  register_transfer(ctx);
+  if (carrier_filetransfer_accept_connect(ctx->ft) < 0) {
+    std::ostringstream msg;
+    msg << "[beagle-sdk] carrier_filetransfer_accept_connect failed: 0x" << std::hex
+        << carrier_get_error() << std::dec;
+    log_line(msg.str());
+    take_transfer(ctx->ft);
+    carrier_filetransfer_close(ctx->ft);
+    ctx->target.close();
+  }
+}
+
 bool friend_list_callback(const CarrierFriendInfo* info, void* context);
 
 void friend_message_callback(Carrier* carrier,
@@ -812,7 +1392,71 @@ void friend_message_callback(Carrier* carrier,
 
   BeagleIncomingMessage incoming;
   incoming.peer = from ? from : "";
-  incoming.text.assign(static_cast<const char*>(msg), len);
+  PackedFilePayload file_payload;
+  if (decode_beaglechat_file_payload(msg, len, file_payload)) {
+    if (file_payload.bytes_len > kMaxBeaglechatFileBytes) {
+      incoming.filename = file_payload.filename;
+      incoming.media_type = file_payload.content_type;
+      incoming.size = static_cast<unsigned long long>(file_payload.bytes_len);
+      incoming.text = "[file rejected: exceeds 5MB beaglechat payload limit]";
+      log_line(std::string("[beagle-sdk] rejected incoming beaglechat file from ")
+               + incoming.peer + " file=" + incoming.filename
+               + " size=" + std::to_string(file_payload.bytes_len));
+    } else {
+    ensure_dir(state->media_dir);
+    std::ostringstream path;
+    path << state->media_dir << "/" << std::time(nullptr) << "_" << file_payload.filename;
+    std::ofstream out(path.str(), std::ios::binary | std::ios::trunc);
+    if (out) {
+      out.write(reinterpret_cast<const char*>(file_payload.bytes),
+                static_cast<std::streamsize>(file_payload.bytes_len));
+      out.close();
+      incoming.media_path = path.str();
+      incoming.filename = file_payload.filename;
+      incoming.media_type = file_payload.content_type;
+      incoming.size = static_cast<unsigned long long>(file_payload.bytes_len);
+      incoming.text.clear();
+      log_line(std::string("[beagle-sdk] received beaglechat file from ")
+               + incoming.peer + " file=" + incoming.filename
+               + " size=" + std::to_string(file_payload.bytes_len));
+    } else {
+      log_line(std::string("[beagle-sdk] failed to persist incoming file from ")
+               + incoming.peer + " file=" + file_payload.filename);
+      incoming.text.assign(static_cast<const char*>(msg), len);
+    }
+    }
+  } else {
+    InlineJsonMedia inline_media;
+    if (decode_inline_json_media_payload(msg, len, inline_media)) {
+      ensure_dir(state->media_dir);
+      std::ostringstream path;
+      path << state->media_dir << "/" << std::time(nullptr) << "_" << inline_media.filename;
+      std::ofstream out(path.str(), std::ios::binary | std::ios::trunc);
+      if (out) {
+        out.write(reinterpret_cast<const char*>(inline_media.bytes.data()),
+                  static_cast<std::streamsize>(inline_media.bytes.size()));
+        out.close();
+        incoming.media_path = path.str();
+        incoming.filename = inline_media.filename;
+        incoming.media_type = inline_media.media_type;
+        incoming.size = static_cast<unsigned long long>(inline_media.bytes.size());
+        incoming.text.clear();
+        log_line(std::string("[beagle-sdk] received inline json media from ")
+                 + incoming.peer + " file=" + incoming.filename
+                 + " size=" + std::to_string(inline_media.bytes.size()));
+      } else {
+        log_line(std::string("[beagle-sdk] failed to persist inline json media from ")
+                 + incoming.peer + " file=" + inline_media.filename);
+        incoming.text.assign(static_cast<const char*>(msg), len);
+      }
+    } else {
+      if (len > 1024) {
+        log_line(std::string("[beagle-sdk] inline json media decode miss peer=") + incoming.peer
+                 + " len=" + std::to_string(len));
+      }
+      incoming.text.assign(static_cast<const char*>(msg), len);
+    }
+  }
   incoming.ts = timestamp;
   state->on_incoming(incoming);
 
@@ -830,7 +1474,12 @@ void friend_message_callback(Carrier* carrier,
 
   std::ostringstream line;
   line << "[beagle-sdk] message (" << (offline ? "offline" : "online")
-       << ") from " << incoming.peer << ": " << incoming.text;
+       << ") from " << incoming.peer;
+  if (!incoming.media_path.empty()) {
+    line << " [file] " << incoming.filename << " (" << incoming.size << " bytes)";
+  } else {
+    line << ": " << incoming.text;
+  }
   log_line(line.str());
 }
 
@@ -1001,6 +1650,11 @@ bool BeagleSdk::start(const BeagleSdkOptions& options, BeagleIncomingCallback on
     g_state.db_config_path = g_state.persistent_location + "/beagle_db.json";
     g_state.friend_state_path = g_state.persistent_location + "/friend_state.tsv";
     g_state.friend_event_log_path = g_state.persistent_location + "/friend_events.log";
+    g_state.media_dir = g_state.persistent_location + "/media";
+    ensure_dir(g_state.media_dir);
+  } else {
+    g_state.media_dir = "./media";
+    ensure_dir(g_state.media_dir);
   }
 
   CarrierCallbacks callbacks;
@@ -1028,6 +1682,13 @@ bool BeagleSdk::start(const BeagleSdkOptions& options, BeagleIncomingCallback on
   }
 
   g_state.carrier = carrier;
+
+  if (carrier_filetransfer_init(g_state.carrier, filetransfer_connect_callback, &g_state) < 0) {
+    std::ostringstream msg;
+    msg << "[beagle-sdk] carrier_filetransfer_init failed: 0x" << std::hex
+        << carrier_get_error() << std::dec;
+    log_line(msg.str());
+  }
 
   char buf[CARRIER_MAX_ADDRESS_LEN + 1] = {0};
   char idbuf[CARRIER_MAX_ID_LEN + 1] = {0};
@@ -1066,8 +1727,18 @@ bool BeagleSdk::start(const BeagleSdkOptions& options, BeagleIncomingCallback on
 
 void BeagleSdk::stop() {
   if (!g_state.carrier) return;
+  carrier_filetransfer_cleanup(g_state.carrier);
   carrier_kill(g_state.carrier);
   if (g_state.loop_thread.joinable()) g_state.loop_thread.join();
+  {
+    std::lock_guard<std::mutex> lock(g_ft_mu);
+    for (auto& it : g_transfers) {
+      if (it.second && it.second->source.is_open()) it.second->source.close();
+      if (it.second && it.second->target.is_open()) it.second->target.close();
+      if (it.first) carrier_filetransfer_close(it.first);
+    }
+    g_transfers.clear();
+  }
   g_state.carrier = nullptr;
 }
 
@@ -1097,25 +1768,77 @@ bool BeagleSdk::send_media(const std::string& peer,
                            const std::string& media_url,
                            const std::string& media_type,
                            const std::string& filename) {
-  std::string payload;
-  if (!caption.empty()) payload += caption;
-  if (!media_url.empty()) {
-    if (!payload.empty()) payload += "\n";
-    payload += media_url;
-  } else if (!media_path.empty()) {
-    if (!payload.empty()) payload += "\n";
-    payload += media_path;
-  }
-  if (!filename.empty()) {
-    if (!payload.empty()) payload += "\n";
-    payload += "filename: " + filename;
-  }
-  if (!media_type.empty()) {
-    if (!payload.empty()) payload += "\n";
-    payload += "mediaType: " + media_type;
+  if (!g_state.carrier) return false;
+
+  if (media_path.empty()) {
+    std::string payload;
+    if (!caption.empty()) payload += caption;
+    if (!media_url.empty()) {
+      if (!payload.empty()) payload += "\n";
+      payload += media_url;
+    }
+    if (!filename.empty()) {
+      if (!payload.empty()) payload += "\n";
+      payload += "filename: " + filename;
+    }
+    if (!media_type.empty()) {
+      if (!payload.empty()) payload += "\n";
+      payload += "mediaType: " + media_type;
+    }
+    return send_text(peer, payload);
   }
 
-  return send_text(peer, payload);
+  unsigned long long size = file_size_bytes(media_path);
+  if (size == 0) {
+    log_line(std::string("[beagle-sdk] send_media invalid file path: ") + media_path);
+    return false;
+  }
+  std::string send_filename = sanitize_filename(!filename.empty() ? filename : basename_of(media_path));
+  std::string send_media_type = !media_type.empty() ? media_type : infer_media_type_from_filename(send_filename);
+  std::vector<unsigned char> file_bytes;
+  if (!read_file_binary(media_path, file_bytes)) {
+    log_line(std::string("[beagle-sdk] send_media failed to read file: ") + media_path);
+    return false;
+  }
+  if (file_bytes.size() > kMaxBeaglechatFileBytes) {
+    log_line(std::string("[beagle-sdk] send_media file too large for beaglechat payload: ")
+             + media_path + " size=" + std::to_string(file_bytes.size())
+             + " max=" + std::to_string(kMaxBeaglechatFileBytes));
+    return false;
+  }
+
+  std::vector<unsigned char> payload;
+  if (!encode_beaglechat_file_payload(send_filename, send_media_type, file_bytes, payload)) {
+    log_line("[beagle-sdk] send_media failed to pack beaglechat payload");
+    return false;
+  }
+
+  if (!caption.empty()) {
+    send_text(peer, caption);
+  }
+
+  uint32_t msgid = 0;
+  int rc = carrier_send_friend_message(g_state.carrier,
+                                       peer.c_str(),
+                                       payload.data(),
+                                       payload.size(),
+                                       &msgid,
+                                       nullptr,
+                                       nullptr);
+  if (rc < 0) {
+    std::ostringstream msg;
+    msg << "[beagle-sdk] send_media(beaglechat payload) failed: 0x" << std::hex
+        << carrier_get_error() << std::dec;
+    log_line(msg.str());
+    return false;
+  }
+
+  log_line(std::string("[beagle-sdk] send_media(beaglechat payload) ok msgid=")
+           + std::to_string(msgid)
+           + " peer=" + peer
+           + " file=" + send_filename
+           + " size=" + std::to_string(size));
+  return true;
 }
 
 #if !BEAGLE_SDK_STUB
