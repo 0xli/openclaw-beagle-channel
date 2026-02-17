@@ -7,8 +7,8 @@ Complete guide for compiling and installing OpenClaw's Beagle Chat channel, incl
 Clone these two repositories to get started:
 
 ```bash
-# 1. Elastos Carrier Native SDK (the P2P networking layer)
-git clone https://github.com/0xli/Elastos.NET.Carrier.Native.SDK.git
+# 1. Elastos Carrier Native SDK (the P2P networking layer, with offline replay fix)
+git clone https://github.com/decentnetworks/Elastos.NET.Carrier.Native.SDK.git
 
 # 2. OpenClaw Beagle Channel (the OpenClaw integration)
 git clone https://github.com/decentnetworks/openclaw-beagle-channel.git
@@ -71,11 +71,12 @@ This is the foundational dependency. The SDK provides P2P mesh networking over t
 
 ```bash
 cd ~/devs
-git clone https://github.com/0xli/Elastos.NET.Carrier.Native.SDK.git
+git clone https://github.com/decentnetworks/Elastos.NET.Carrier.Native.SDK.git
 cd Elastos.NET.Carrier.Native.SDK
+git checkout fix/express-offline-watermark-replay
 ```
 
-> **Note:** We use the fork at `github.com/0xli/` which includes necessary patches for OpenClaw integration.
+> **Note:** We currently use `decentnetworks/fix/express-offline-watermark-replay` to include the offline replay fix in Express. Upstream PR: `https://github.com/0xli/Elastos.NET.Carrier.Native.SDK/pull/3`.
 
 ### Configure and Build
 
@@ -384,8 +385,8 @@ ls $BEAGLE_SDK_ROOT/config/carrier.conf
 ## References
 
 - **Elastos Carrier SDK** (Elastos official): https://github.com/elastos/Elastos.NET.Carrier.Native.SDK
-- **Elastos Carrier SDK** (fork with patches): https://github.com/0xli/Elastos.NET.Carrier.Native.SDK
-- **Elastos Carrier SDK**: https://github.com/0xli/Elastos.NET.Carrier.Native.SDK
+- **Elastos Carrier SDK** (fork with replay fix branch): https://github.com/decentnetworks/Elastos.NET.Carrier.Native.SDK
+- **Elastos Carrier SDK** (upstream target): https://github.com/0xli/Elastos.NET.Carrier.Native.SDK
 - **OpenClaw Beagle Channel**: https://github.com/decentnetworks/openclaw-beagle-channel
 - **Beagle Chat**: https://beagle.chat
 - **Decent Network**: https://decent.network

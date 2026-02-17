@@ -10,6 +10,20 @@ Native sidecar daemon that bridges OpenClaw to the Beagle network SDK.
 * CMake (version 3.16 or newer)
 * For the "Real SDK" build, you need a pre-built [Elastos.NET.Carrier.Native.SDK](https://github.com/elastos/Elastos.NET.Carrier.Native.SDK).
 
+### Recommended SDK Branch (offline replay fix)
+
+Until upstream merges the fix for replayed offline messages, build sidecar against this fork branch:
+
+```bash
+cd ~/devs
+git clone https://github.com/decentnetworks/Elastos.NET.Carrier.Native.SDK.git
+cd Elastos.NET.Carrier.Native.SDK
+git checkout fix/express-offline-watermark-replay
+```
+
+PR tracking this fix upstream:
+`https://github.com/0xli/Elastos.NET.Carrier.Native.SDK/pull/3`
+
 ### Build (Stub)
 
 This mode builds the sidecar without any Beagle network functionality. This is useful for development and testing of the sidecar itself without requiring the full SDK.
