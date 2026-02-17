@@ -2,7 +2,17 @@
 
 Native sidecar daemon that bridges OpenClaw to the Beagle network SDK.
 
-## Build (Stub)
+## Building
+
+### Prerequisites
+
+* A C++17 compliant compiler (e.g., GCC, Clang)
+* CMake (version 3.16 or newer)
+* For the "Real SDK" build, you need a pre-built [Elastos.NET.Carrier.Native.SDK](https://github.com/elastos/Elastos.NET.Carrier.Native.SDK).
+
+### Build (Stub)
+
+This mode builds the sidecar without any Beagle network functionality. This is useful for development and testing of the sidecar itself without requiring the full SDK.
 
 ```bash
 cmake -S . -B build -DBEAGLE_SDK_STUB=ON
@@ -10,9 +20,11 @@ cmake --build build
 ./build/beagle-sidecar --port 39091 --token devtoken
 ```
 
-## Build (Real SDK)
+### Build (Real SDK)
 
-Set the SDK root and disable stub mode:
+This mode builds the sidecar with the full Beagle network SDK.
+
+First, make sure you have built the `Elastos.NET.Carrier.Native.SDK`. Then, set the `BEAGLE_SDK_ROOT` environment variable to the path of the SDK and run cmake.
 
 ```bash
 export BEAGLE_SDK_ROOT=/path/to/Elastos.NET.Carrier.Native.SDK
@@ -20,7 +32,11 @@ cmake -S . -B build -DBEAGLE_SDK_STUB=OFF -DBEAGLE_SDK_ROOT=$BEAGLE_SDK_ROOT
 cmake --build build
 ```
 
-If your SDK build directory is non-standard, also pass `-DBEAGLE_SDK_BUILD_DIR=/path/to/build`.
+If your SDK build directory is in a non-standard location, you can specify it with the `BEAGLE_SDK_BUILD_DIR` variable:
+
+```bash
+cmake -S . -B build -DBEAGLE_SDK_STUB=OFF -DBEAGLE_SDK_ROOT=$BEAGLE_SDK_ROOT -DBEAGLE_SDK_BUILD_DIR=/path/to/sdk/build/dir
+```
 
 Run with a Carrier config:
 

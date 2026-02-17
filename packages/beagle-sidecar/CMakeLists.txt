@@ -53,6 +53,8 @@ if(NOT BEAGLE_SDK_STUB)
 
   target_link_directories(beagle-sidecar PRIVATE
     ${BEAGLE_SDK_BUILD_DIR}/src/carrier
+    ${BEAGLE_SDK_BUILD_DIR}/src/session
+    ${BEAGLE_SDK_BUILD_DIR}/src/filetransfer
     ${BEAGLE_SDK_INTERMEDIATE_DIR}/lib
   )
 

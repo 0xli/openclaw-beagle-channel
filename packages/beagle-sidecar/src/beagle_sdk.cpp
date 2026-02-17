@@ -13,6 +13,7 @@
 #include <dirent.h>
 #include <fstream>
 #include <iostream>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -142,13 +143,17 @@ struct RuntimeState {
   std::string db_config_path;
   std::string friend_state_path;
   std::string friend_event_log_path;
+  std::string incoming_event_log_path;
   std::string media_dir;
   std::string user_id;
   std::string address;
+  int64_t startup_ts_us = 0;
   BeagleStatus status;
   std::unordered_set<std::string> welcomed_peers;
   std::unordered_map<std::string, bool> peer_prefers_inline_media;
   std::unordered_map<std::string, std::string> peer_media_payload_hint;
+  std::unordered_set<std::string> seen_incoming_signatures;
+  std::deque<std::string> seen_incoming_order;
   std::map<std::string, FriendState> friend_state;
   DbConfig db;
   std::mutex crawler_mu;
@@ -1060,6 +1065,55 @@ static std::string json_escape(const std::string& in) {
   return out;
 }
 
+static std::string dedupe_text_fragment(const std::string& text) {
+  if (text.size() <= 256) return text;
+  return text.substr(0, 192) + "...|" + std::to_string(text.size()) + "|..." + text.substr(text.size() - 48);
+}
+
+static std::string preview_text(const std::string& text, size_t max_len = 120) {
+  std::string out;
+  out.reserve(std::min(text.size(), max_len));
+  for (char c : text) {
+    if (c == '\0') continue;
+    if (c == '\n' || c == '\r' || c == '\t') {
+      out.push_back(' ');
+      continue;
+    }
+    unsigned char u = static_cast<unsigned char>(c);
+    if (u < 0x20 || u == 0x7F) continue;
+    out.push_back(c);
+    if (out.size() >= max_len) break;
+  }
+  return out;
+}
+
+static std::string build_incoming_signature(const BeagleIncomingMessage& incoming, bool offline) {
+  std::ostringstream sig;
+  sig << incoming.peer << "|"
+      << incoming.ts << "|"
+      << (offline ? 1 : 0) << "|"
+      << incoming.filename << "|"
+      << incoming.media_type << "|"
+      << incoming.size << "|"
+      << dedupe_text_fragment(incoming.text);
+  return sig.str();
+}
+
+static bool remember_incoming_signature(RuntimeState* state, const std::string& signature) {
+  if (!state) return true;
+  constexpr size_t kMaxSeenIncoming = 20000;
+  std::lock_guard<std::mutex> lock(state->state_mu);
+  auto inserted = state->seen_incoming_signatures.insert(signature);
+  if (!inserted.second) return false;
+  state->seen_incoming_order.push_back(signature);
+  while (state->seen_incoming_order.size() > kMaxSeenIncoming) {
+    const std::string& oldest = state->seen_incoming_order.front();
+    state->seen_incoming_signatures.erase(oldest);
+    state->seen_incoming_order.pop_front();
+  }
+  return true;
+}
+
 static void ensure_profile_file(RuntimeState* state);
 
 static bool append_line(const std::string& path, const std::string& line) {
@@ -1067,6 +1121,31 @@ static bool append_line(const std::string& path, const std::string& line) {
   if (!out) return false;
   out << line << "\n";
   return static_cast<bool>(out);
+}
+
+static void log_incoming_event(RuntimeState* state,
+                               const BeagleIncomingMessage& incoming,
+                               bool offline,
+                               const char* action,
+                               const std::string& signature) {
+  if (!state || state->incoming_event_log_path.empty()) return;
+  std::ostringstream line;
+  line << "{"
+       << "\"loggedAt\":\"" << json_escape(log_ts()) << "\","
+       << "\"action\":\"" << json_escape(action ? action : "") << "\","
+       << "\"peer\":\"" << json_escape(incoming.peer) << "\","
+       << "\"mode\":\"" << (offline ? "offline" : "online") << "\","
+       << "\"carrierTs\":" << incoming.ts << ","
+       << "\"startupTs\":" << state->startup_ts_us << ","
+       << "\"kind\":\"" << (incoming.media_path.empty() ? "text" : "file") << "\","
+       << "\"text\":\"" << json_escape(incoming.text) << "\","
+       << "\"textPreview\":\"" << json_escape(preview_text(incoming.text, 200)) << "\","
+       << "\"filename\":\"" << json_escape(incoming.filename) << "\","
+       << "\"mediaType\":\"" << json_escape(incoming.media_type) << "\","
+       << "\"size\":" << incoming.size << ","
+       << "\"signature\":\"" << json_escape(signature) << "\""
+       << "}";
+  append_line(state->incoming_event_log_path, line.str());
 }
 
 static bool extract_json_string(const std::string& body, const std::string& key, std::string& out) {
@@ -1334,6 +1413,18 @@ static void load_welcomed_peers(RuntimeState* state) {
   while (std::getline(in, line)) {
     if (!line.empty()) state->welcomed_peers.insert(line);
   }
+}
+
+static void save_welcomed_peers(RuntimeState* state) {
+  if (!state || state->welcome_state_path.empty()) return;
+  std::ostringstream out;
+  {
+    std::lock_guard<std::mutex> lock(state->state_mu); // Lock access to welcomed_peers
+    for (const auto& peer : state->welcomed_peers) {
+      out << peer << "\n";
+    }
+  }
+  write_file(state->welcome_state_path, out.str());
 }
 
 static std::string sanitize_tsv(const std::string& in) {
@@ -1833,7 +1924,7 @@ static void send_welcome_once(RuntimeState* state, const std::string& peer, cons
       state->welcomed_peers.insert(peer);
     }
     if (!state->welcome_state_path.empty()) {
-      append_line(state->welcome_state_path, peer);
+      save_welcomed_peers(state);
     }
     log_line(std::string("[beagle-sdk] welcome message sent (") + reason + ") to " + peer);
   }
@@ -2309,6 +2400,52 @@ void friend_message_callback(Carrier* carrier,
     }
   }
   incoming.ts = timestamp;
+  std::string signature = build_incoming_signature(incoming, offline);
+  // Carrier sometimes replays very old offline messages from Express.
+  // Drop stale offline payloads immediately to avoid re-triggering agents.
+  if (offline && state->startup_ts_us > 0 && incoming.ts > 0) {
+    constexpr int64_t kOfflineStaleWindowUs = 5LL * 60LL * 1000LL * 1000LL;
+    if (incoming.ts < (state->startup_ts_us - kOfflineStaleWindowUs)) {
+      log_incoming_event(state, incoming, offline, "dropped_stale_offline", signature);
+      std::ostringstream msg;
+      msg << "[beagle-sdk] dropped stale offline message"
+          << " peer=" << incoming.peer
+          << " ts=" << incoming.ts
+          << " startup_ts=" << state->startup_ts_us;
+      if (!incoming.media_path.empty()) {
+        msg << " kind=file"
+            << " filename=" << incoming.filename
+            << " media_type=" << incoming.media_type
+            << " size=" << incoming.size;
+      } else {
+        msg << " kind=text"
+            << " text=\"" << preview_text(incoming.text) << "\"";
+      }
+      log_line(msg.str());
+      return;
+    }
+  }
+  if (!remember_incoming_signature(state, signature)) {
+    log_incoming_event(state, incoming, offline, "skipped_replay", signature);
+    std::ostringstream msg;
+    msg << "[beagle-sdk] skipped replayed incoming message"
+        << " peer=" << incoming.peer
+        << " mode=" << (offline ? "offline" : "online")
+        << " ts=" << incoming.ts;
+    if (!incoming.media_path.empty()) {
+      msg << " kind=file"
+          << " filename=" << incoming.filename
+          << " media_type=" << incoming.media_type
+          << " size=" << incoming.size;
+    } else {
+      msg << " kind=text"
+          << " text=\"" << preview_text(incoming.text) << "\"";
+    }
+    msg << " signature=\"" << preview_text(signature, 160) << "\"";
+    log_line(msg.str());
+    return;
+  }
+  log_incoming_event(state, incoming, offline, "forwarded", signature);
   state->on_incoming(incoming);
 
   {
@@ -2501,10 +2638,12 @@ bool BeagleSdk::start(const BeagleSdkOptions& options, BeagleIncomingCallback on
     g_state.db_config_path = g_state.persistent_location + "/beagle_db.json";
     g_state.friend_state_path = g_state.persistent_location + "/friend_state.tsv";
     g_state.friend_event_log_path = g_state.persistent_location + "/friend_events.log";
+    g_state.incoming_event_log_path = g_state.persistent_location + "/incoming_events.jsonl";
     g_state.media_dir = g_state.persistent_location + "/media";
     ensure_dir(g_state.media_dir);
   } else {
     g_state.media_dir = "./media";
+    g_state.incoming_event_log_path = "./incoming_events.jsonl";
     ensure_dir(g_state.media_dir);
   }
 
@@ -2522,6 +2661,7 @@ bool BeagleSdk::start(const BeagleSdkOptions& options, BeagleIncomingCallback on
   callbacks.friend_invite = friend_invite_callback;
 
   g_state.on_incoming = std::move(on_incoming);
+  g_state.startup_ts_us = static_cast<int64_t>(std::time(nullptr)) * 1000000LL;
 
   Carrier* carrier = carrier_new(&opts, &callbacks, &g_state);
   carrier_config_free(&opts);

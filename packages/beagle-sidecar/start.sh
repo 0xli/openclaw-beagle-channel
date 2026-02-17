@@ -65,6 +65,7 @@ case "$cmd" in
   run)
     ensure_sdk_root
     build_args
+    export LD_LIBRARY_PATH="${BEAGLE_SDK_ROOT}/build/linux/src/carrier:${BEAGLE_SDK_ROOT}/build/linux/src/session:${BEAGLE_SDK_ROOT}/build/linux/src/filetransfer:${BEAGLE_SDK_ROOT}/build/linux/intermediates/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     exec "$BIN" "${ARGS[@]}"
     ;;
   --install-systemd-user)

@@ -5,6 +5,10 @@ const { existsSync } = require("fs");
 const { readdirSync, statSync } = require("fs");
 const { isAbsolute, resolve, join, basename } = require("path");
 
+const INBOUND_SEEN_MAX = 10_000;
+const inboundSeen = new Set<string>();
+const inboundSeenOrder: string[] = [];
+
 function normalizePeerId(value: any) {
   return String(value ?? "")
     .replace(/^beagle:\/\//i, "")
@@ -117,6 +121,28 @@ function isPictureRequest(text: any) {
   const t = String(text ?? "").toLowerCase();
   if (!t) return false;
   return /send me (a |an )?(picture|photo|image)/i.test(t) || /发.*(图|图片|照片)/.test(t);
+}
+
+function canonicalPeerId(value: any) {
+  return normalizePeerId(value).toLowerCase();
+}
+
+function normalizeInboundText(value: any) {
+  return String(value ?? "")
+    .replace(/\u0000+/g, "")
+    .replace(/[\u0001-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
+    .trim();
+}
+
+function rememberInboundSignature(signature: string) {
+  if (inboundSeen.has(signature)) return false;
+  inboundSeen.add(signature);
+  inboundSeenOrder.push(signature);
+  if (inboundSeenOrder.length > INBOUND_SEEN_MAX) {
+    const oldest = inboundSeenOrder.shift();
+    if (oldest) inboundSeen.delete(oldest);
+  }
+  return true;
 }
 
 // OpenClaw plugin entrypoint. Types are intentionally loose to avoid
@@ -239,7 +265,7 @@ async function handleInboundEvent(api: any, accountId: string, account: BeagleAc
       return;
     }
 
-    const rawBody = ev?.text ?? "";
+    const rawBody = normalizeInboundText(ev?.text ?? "");
     const inboundMediaUrl = ev?.mediaUrl ?? "";
     const inboundMediaPath = ev?.mediaPath ?? "";
     const inboundMediaType = ev?.mediaType ?? "";
@@ -253,6 +279,22 @@ async function handleInboundEvent(api: any, accountId: string, account: BeagleAc
 
     const peerId = String(ev?.peer ?? "");
     const normalizedPeerId = normalizePeerId(peerId);
+    const canonicalId = canonicalPeerId(peerId) || normalizedPeerId;
+    const eventId = String(ev?.msgId ?? "");
+    const dedupeKey = [
+      accountId,
+      canonicalId,
+      eventId || "(no-msgid)",
+      String(timestamp),
+      rawBody,
+      inboundMediaPath,
+      inboundMediaUrl,
+      inboundFilename
+    ].join("|");
+    if (!rememberInboundSignature(dedupeKey)) {
+      api?.logger?.info?.(`[beagle] skip duplicate inbound event peer=${normalizedPeerId} msgId=${eventId || "(none)"}`);
+      return;
+    }
     const route = core.channel.routing.resolveAgentRoute({
       cfg: api?.config ?? {},
       channel: "beagle",
@@ -263,7 +305,7 @@ async function handleInboundEvent(api: any, accountId: string, account: BeagleAc
       }
     });
 
-    const sessionKey = `beagle:${accountId}:${normalizedPeerId}`;
+    const sessionKey = `beagle:${accountId}:${canonicalId}`;
 
     const storePath = core.channel.session.resolveStorePath(api?.config?.session?.store, {
       agentId: route.agentId
