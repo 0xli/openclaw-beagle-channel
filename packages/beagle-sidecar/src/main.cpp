@@ -427,18 +427,21 @@ int main(int argc, char** argv) {
       std::string media_url;
       std::string media_type;
       std::string filename;
+      std::string out_format;
       extract_json_string(body, "peer", peer);
       extract_json_string(body, "caption", caption);
       extract_json_string(body, "mediaPath", media_path);
       extract_json_string(body, "mediaUrl", media_url);
       extract_json_string(body, "mediaType", media_type);
       extract_json_string(body, "filename", filename);
+      extract_json_string(body, "outFormat", out_format);
       log_line(std::string("[sidecar] /sendMedia peer=") + peer
                + " caption_len=" + std::to_string(caption.size())
                + " media_url_len=" + std::to_string(media_url.size())
-               + " media_path_len=" + std::to_string(media_path.size()));
+               + " media_path_len=" + std::to_string(media_path.size())
+               + " out_format=" + (out_format.empty() ? "(default)" : out_format));
 
-      bool ok = sdk.send_media(peer, caption, media_path, media_url, media_type, filename);
+      bool ok = sdk.send_media(peer, caption, media_path, media_url, media_type, filename, out_format);
       send_response(client_fd, ok ? 200 : 500, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
     } else {
       send_response(client_fd, 404, "application/json", "{\"ok\":false,\"error\":\"not_found\"}");

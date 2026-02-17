@@ -1,24 +1,34 @@
 #include "beagle_sdk.h"
 
+#include <array>
+#include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
 #include <cstring>
+#include <dirent.h>
 #include <fstream>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include <string.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #if BEAGLE_SDK_STUB
 
@@ -42,7 +52,8 @@ bool BeagleSdk::send_media(const std::string& peer,
                            const std::string& media_path,
                            const std::string& media_url,
                            const std::string& media_type,
-                           const std::string& filename) {
+                           const std::string& filename,
+                           const std::string& out_format) {
   std::cerr << "[beagle-sdk] send_media stub. peer=" << peer
             << " caption=" << caption
             << " media_path=" << media_path
@@ -104,6 +115,10 @@ struct DbConfig {
   std::string user = "beagle";
   std::string password = "A1anSn00py";
   std::string database = "beagle";
+  bool use_crawler_index = false;
+  std::string crawler_data_dir = "~/.elacrawler";
+  int crawler_refresh_seconds = 60;
+  int crawler_lookback_files = 20;
 };
 
 struct ProfileInfo {
@@ -132,8 +147,14 @@ struct RuntimeState {
   std::string address;
   BeagleStatus status;
   std::unordered_set<std::string> welcomed_peers;
+  std::unordered_map<std::string, bool> peer_prefers_inline_media;
+  std::unordered_map<std::string, std::string> peer_media_payload_hint;
   std::map<std::string, FriendState> friend_state;
   DbConfig db;
+  std::mutex crawler_mu;
+  std::map<std::string, std::pair<std::string, std::string>> crawler_index;
+  std::string crawler_index_signature;
+  std::time_t crawler_index_last_refresh = 0;
 };
 
 struct TransferContext {
@@ -153,10 +174,39 @@ struct TransferContext {
   uint64_t transferred = 0;
   std::ifstream source;
   std::ofstream target;
+  std::mutex connect_mu;
+  std::condition_variable connect_cv;
+  bool connect_done = false;
+  bool connect_ok = false;
+  std::mutex transfer_mu;
+  std::condition_variable transfer_cv;
+  bool transfer_done = false;
+  bool transfer_ok = false;
+  std::string transfer_detail;
 };
 
 static std::mutex g_ft_mu;
 static std::map<CarrierFileTransfer*, std::shared_ptr<TransferContext>> g_transfers;
+
+static void mark_sender_transfer_result(const std::shared_ptr<TransferContext>& ctx,
+                                        bool ok,
+                                        const std::string& detail) {
+  if (!ctx || !ctx->is_sender) return;
+  std::lock_guard<std::mutex> lock(ctx->transfer_mu);
+  if (ctx->transfer_done) return;
+  ctx->transfer_done = true;
+  ctx->transfer_ok = ok;
+  ctx->transfer_detail = detail;
+  ctx->transfer_cv.notify_all();
+}
+static void persist_crawler_index_to_db(
+    RuntimeState* state,
+    const std::map<std::string, std::pair<std::string, std::string>>& rows,
+    const std::string& source_file,
+    std::time_t seen_at);
+static std::pair<std::string, std::string> lookup_ip_location_from_crawler_cache_db(
+    RuntimeState* state,
+    const std::string& friendid);
 
 static bool file_exists(const std::string& path) {
   std::ifstream f(path);
@@ -168,6 +218,296 @@ static void ensure_dir(const std::string& path) {
   struct stat st;
   if (stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) return;
   mkdir(path.c_str(), 0755);
+}
+
+static std::vector<std::string> split_ws(const std::string& s) {
+  std::vector<std::string> out;
+  std::istringstream iss(s);
+  std::string token;
+  while (iss >> token) out.push_back(token);
+  return out;
+}
+
+static std::string trim_copy(const std::string& s);
+
+static bool csv_has_token(const std::string& csv, const std::string& token) {
+  if (csv.empty() || token.empty()) return false;
+  std::string t = trim_copy(token);
+  if (t.empty()) return false;
+  size_t start = 0;
+  while (start < csv.size()) {
+    size_t comma = csv.find(',', start);
+    if (comma == std::string::npos) comma = csv.size();
+    std::string part = trim_copy(csv.substr(start, comma - start));
+    if (!part.empty() && part == t) return true;
+    start = comma + 1;
+  }
+  return false;
+}
+
+static std::string trim_copy(const std::string& s) {
+  size_t b = 0;
+  while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b]))) b++;
+  size_t e = s.size();
+  while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) e--;
+  return s.substr(b, e - b);
+}
+
+static std::string expand_home(const std::string& path) {
+  if (path.empty()) return path;
+  if (path[0] != '~') return path;
+  const char* home = std::getenv("HOME");
+  if (!home) return path;
+  if (path.size() == 1) return std::string(home);
+  if (path[1] == '/') return std::string(home) + path.substr(1);
+  return path;
+}
+
+static bool is_valid_ip_token(const std::string& ip) {
+  if (ip.empty()) return false;
+  for (char c : ip) {
+    if (std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == ':' || c == '-') continue;
+    return false;
+  }
+  return true;
+}
+
+static std::string endpoint_to_ip(const std::string& endpoint) {
+  if (endpoint.empty() || endpoint == "*") return "";
+  if (endpoint.front() == '[') {
+    size_t end = endpoint.find(']');
+    if (end == std::string::npos || end <= 1) return "";
+    if (end + 2 > endpoint.size() || endpoint[end + 1] != ':') return "";
+    std::string port = endpoint.substr(end + 2);
+    if (port.empty()) return "";
+    if (port != "*") {
+      for (char c : port) {
+        if (!std::isdigit(static_cast<unsigned char>(c))) return "";
+      }
+    }
+    return endpoint.substr(1, end - 1);
+  }
+  size_t colon = endpoint.rfind(':');
+  if (colon == std::string::npos || colon == 0) return "";
+  std::string port = endpoint.substr(colon + 1);
+  if (port.empty()) return "";
+  if (port != "*") {
+    for (char c : port) {
+      if (!std::isdigit(static_cast<unsigned char>(c))) return "";
+    }
+  }
+  return endpoint.substr(0, colon);
+}
+
+static std::string endpoint_to_port(const std::string& endpoint) {
+  if (endpoint.empty() || endpoint == "*") return "";
+  if (endpoint.front() == '[') {
+    size_t end = endpoint.find(']');
+    if (end == std::string::npos || end + 2 > endpoint.size() || endpoint[end + 1] != ':') return "";
+    return endpoint.substr(end + 2);
+  }
+  size_t colon = endpoint.rfind(':');
+  if (colon == std::string::npos || colon + 1 >= endpoint.size()) return "";
+  return endpoint.substr(colon + 1);
+}
+
+static bool is_ipv4_private(const std::string& ip) {
+  int a = -1, b = -1, c = -1, d = -1;
+  if (std::sscanf(ip.c_str(), "%d.%d.%d.%d", &a, &b, &c, &d) != 4) return false;
+  if (a == 10) return true;
+  if (a == 127) return true;
+  if (a == 192 && b == 168) return true;
+  if (a == 172 && b >= 16 && b <= 31) return true;
+  if (a == 169 && b == 254) return true;
+  if (a == 100 && b >= 64 && b <= 127) return true;
+  return false;
+}
+
+static std::string guess_location_from_ip(const std::string& ip) {
+  if (ip.empty()) return "";
+  if (ip == "::1" || ip == "127.0.0.1") return "loopback";
+  if (is_ipv4_private(ip)) return "private-network";
+  if (ip.rfind("fc", 0) == 0 || ip.rfind("fd", 0) == 0) return "private-network-ipv6";
+  if (ip.rfind("fe80", 0) == 0) return "link-local-ipv6";
+  return "public-network";
+}
+
+static std::string detect_remote_ip_for_current_process() {
+#ifdef _WIN32
+  return "";
+#else
+  FILE* fp = popen("ss -tnp state established 2>/dev/null", "r");
+  if (!fp) return "";
+  std::array<char, 1024> buf{};
+  std::string needle = "pid=" + std::to_string(::getpid()) + ",";
+  std::set<std::string> strict_carrier_ips;
+  std::set<std::string> fallback_ips;
+  while (std::fgets(buf.data(), static_cast<int>(buf.size()), fp)) {
+    std::string line(buf.data());
+    bool pid_matched = line.find(needle) != std::string::npos;
+    std::vector<std::string> parts = split_ws(line);
+    std::vector<std::string> endpoints;
+    endpoints.reserve(parts.size());
+    for (const auto& p : parts) {
+      if (!endpoint_to_ip(p).empty()) endpoints.push_back(p);
+    }
+    if (endpoints.size() < 2) continue;
+    std::string local_ip = endpoint_to_ip(endpoints[0]);
+    std::string peer_ip = endpoint_to_ip(endpoints[1]);
+    std::string peer_port = endpoint_to_port(endpoints[1]);
+    std::string local_port = endpoint_to_port(endpoints[0]);
+    (void)local_ip;
+    (void)local_port;
+
+    std::string ip = peer_ip;
+    if (ip.empty() || ip == "127.0.0.1" || ip == "::1") continue;
+    if (pid_matched && peer_port == "33445") {
+      strict_carrier_ips.insert(ip);
+      continue;
+    }
+    if (peer_port == "33445") {
+      fallback_ips.insert(ip);
+      continue;
+    }
+    if (pid_matched) fallback_ips.insert(ip);
+  }
+  pclose(fp);
+  if (!strict_carrier_ips.empty()) return *strict_carrier_ips.begin();
+  if (!fallback_ips.empty()) return *fallback_ips.begin();
+  return "";
+#endif
+}
+
+static std::vector<std::string> list_entries(const std::string& dirpath, bool want_dirs, bool suffix_lst) {
+  std::vector<std::string> out;
+  DIR* d = opendir(dirpath.c_str());
+  if (!d) return out;
+  struct dirent* ent = nullptr;
+  while ((ent = readdir(d)) != nullptr) {
+    std::string name = ent->d_name ? ent->d_name : "";
+    if (name.empty() || name == "." || name == "..") continue;
+    if (want_dirs && ent->d_type != DT_DIR && ent->d_type != DT_UNKNOWN) continue;
+    if (!want_dirs && ent->d_type == DT_DIR) continue;
+    if (suffix_lst) {
+      if (name.size() < 4 || name.substr(name.size() - 4) != ".lst") continue;
+    }
+    out.push_back(name);
+  }
+  closedir(d);
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+static std::vector<std::string> find_recent_crawler_lsts(const std::string& data_dir, size_t max_files) {
+  std::string root = expand_home(data_dir);
+  if (root.empty() || max_files == 0) return {};
+  std::vector<std::string> dates = list_entries(root, true, false);
+  if (dates.empty()) return {};
+  std::vector<std::string> out;
+  out.reserve(max_files);
+  for (auto it = dates.rbegin(); it != dates.rend(); ++it) {
+    std::string day_dir = root + "/" + *it;
+    std::vector<std::string> files = list_entries(day_dir, false, true);
+    if (files.empty()) continue;
+    for (auto fit = files.rbegin(); fit != files.rend(); ++fit) {
+      out.push_back(day_dir + "/" + *fit);
+      if (out.size() >= max_files) return out;
+    }
+  }
+  return out;
+}
+
+static bool parse_crawler_line(const std::string& line,
+                               std::string& userid,
+                               std::string& ip,
+                               std::string& location) {
+  size_t c1 = line.find(',');
+  if (c1 == std::string::npos) return false;
+  size_t c2 = line.find(',', c1 + 1);
+  if (c2 == std::string::npos) return false;
+  userid = trim_copy(line.substr(0, c1));
+  ip = trim_copy(line.substr(c1 + 1, c2 - c1 - 1));
+  location = trim_copy(line.substr(c2 + 1));
+  if (userid.empty()) return false;
+  if (!ip.empty() && !is_valid_ip_token(ip)) ip.clear();
+  return true;
+}
+
+static void refresh_crawler_index_if_needed(RuntimeState* state) {
+  if (!state || !state->db.use_crawler_index) return;
+  std::time_t now = std::time(nullptr);
+  {
+    std::lock_guard<std::mutex> lock(state->crawler_mu);
+    if (state->crawler_index_last_refresh != 0
+        && now - state->crawler_index_last_refresh < state->db.crawler_refresh_seconds) {
+      return;
+    }
+    state->crawler_index_last_refresh = now;
+  }
+
+  std::vector<std::string> files =
+      find_recent_crawler_lsts(state->db.crawler_data_dir, static_cast<size_t>(state->db.crawler_lookback_files));
+  if (files.empty()) return;
+
+  std::string signature;
+  signature.reserve(files.size() * 64);
+  std::time_t newest_mtime = 0;
+  std::string newest_file;
+  for (const auto& f : files) {
+    struct stat st{};
+    if (stat(f.c_str(), &st) != 0) continue;
+    signature += f;
+    signature.push_back('|');
+    signature += std::to_string(static_cast<long long>(st.st_mtime));
+    signature.push_back(';');
+    if (st.st_mtime >= newest_mtime) {
+      newest_mtime = st.st_mtime;
+      newest_file = f;
+    }
+  }
+  if (signature.empty()) return;
+
+  {
+    std::lock_guard<std::mutex> lock(state->crawler_mu);
+    if (state->crawler_index_signature == signature) return;
+  }
+
+  std::map<std::string, std::pair<std::string, std::string>> next;
+  for (const auto& f : files) {
+    std::ifstream in(f);
+    if (!in) continue;
+    std::string line;
+    while (std::getline(in, line)) {
+      std::string userid;
+      std::string ip;
+      std::string location;
+      if (!parse_crawler_line(line, userid, ip, location)) continue;
+      if (next.find(userid) != next.end()) continue;
+      next[userid] = {ip, location};
+    }
+  }
+
+  if (newest_file.empty()) newest_file = files.front();
+  persist_crawler_index_to_db(state, next, newest_file, newest_mtime);
+  {
+    std::lock_guard<std::mutex> lock(state->crawler_mu);
+    state->crawler_index.swap(next);
+    state->crawler_index_signature = signature;
+  }
+  log_line("[beagle-sdk] crawler index loaded from last "
+           + std::to_string(files.size()) + " file(s)");
+}
+
+static std::pair<std::string, std::string> lookup_ip_location_from_crawler(RuntimeState* state,
+                                                                            const std::string& friendid) {
+  if (!state || friendid.empty() || !state->db.use_crawler_index) return {"", ""};
+  refresh_crawler_index_if_needed(state);
+  {
+    std::lock_guard<std::mutex> lock(state->crawler_mu);
+    auto it = state->crawler_index.find(friendid);
+    if (it != state->crawler_index.end()) return it->second;
+  }
+  return lookup_ip_location_from_crawler_cache_db(state, friendid);
 }
 
 static unsigned long long file_size_bytes(const std::string& path) {
@@ -314,6 +654,77 @@ static bool parse_json_u64_field(const std::string& json,
   return true;
 }
 
+static bool is_friend_offline_error(int err) {
+  return err == CARRIER_GENERAL_ERROR(ERROR_FRIEND_OFFLINE);
+}
+
+static std::string trim_copy_simple(const std::string& s) {
+  size_t b = 0;
+  while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b]))) b++;
+  size_t e = s.size();
+  while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) e--;
+  return s.substr(b, e - b);
+}
+
+static bool post_payload_to_express_node(RuntimeState* state,
+                                         const std::string& receiver_id,
+                                         const void* bytes,
+                                         size_t len,
+                                         std::string& detail) {
+  if (!state || receiver_id.empty() || !bytes || len == 0 || state->user_id.empty()) {
+    detail = "invalid args";
+    return false;
+  }
+
+  char path_template[] = "/tmp/beagle_express_payload_XXXXXX";
+  int fd = mkstemp(path_template);
+  if (fd < 0) {
+    detail = "mkstemp failed";
+    return false;
+  }
+
+  bool write_ok = true;
+  const unsigned char* p = static_cast<const unsigned char*>(bytes);
+  size_t off = 0;
+  while (off < len) {
+    ssize_t n = write(fd, p + off, len - off);
+    if (n <= 0) {
+      write_ok = false;
+      break;
+    }
+    off += static_cast<size_t>(n);
+  }
+  close(fd);
+  if (!write_ok) {
+    unlink(path_template);
+    detail = "write temp payload failed";
+    return false;
+  }
+
+  std::string url = "https://lens.beagle.chat:443/" + receiver_id + "/" + state->user_id;
+  std::ostringstream cmd;
+  cmd << "curl -sS -m 25 --connect-timeout 8 -o /dev/null -w \"%{http_code}\" "
+      << "-H \"Content-Type: application/octet-stream\" "
+      << "--data-binary @" << path_template << " "
+      << "\"" << url << "\" 2>/dev/null";
+
+  FILE* pipe = popen(cmd.str().c_str(), "r");
+  if (!pipe) {
+    unlink(path_template);
+    detail = "popen curl failed";
+    return false;
+  }
+  char buf[128];
+  std::string out;
+  while (fgets(buf, sizeof(buf), pipe)) out += buf;
+  int rc = pclose(pipe);
+  unlink(path_template);
+
+  std::string code = trim_copy_simple(out);
+  detail = "curl_rc=" + std::to_string(rc) + " http=" + code;
+  return (code == "200" || code == "201");
+}
+
 struct PackedFilePayload {
   std::string filename;
   std::string content_type;
@@ -385,7 +796,11 @@ static bool decode_inline_json_media_payload(const void* msg, size_t len, Inline
   std::string type;
   if (!parse_json_string_field(body, "type", type)) return false;
   type = lowercase(type);
-  if (type != "image" && type != "file") return false;
+  if (type != "image" &&
+      type != "file" &&
+      type != "audio" &&
+      type != "text" &&
+      type != "unknown") return false;
 
   std::string data;
   if (!parse_json_string_field(body, "data", data) || data.empty()) return false;
@@ -416,6 +831,26 @@ static bool decode_inline_json_media_payload(const void* msg, size_t len, Inline
   out.filename = filename;
   out.media_type = media_type;
   out.bytes.swap(decoded);
+  return true;
+}
+
+static bool is_swift_filemodel_json_payload(const void* msg, size_t len) {
+  if (!msg || len < 8 || len > (kMaxBeaglechatFileBytes * 2)) return false;
+  std::string body(static_cast<const char*>(msg), len);
+  while (!body.empty() && (body.back() == '\0' || std::isspace(static_cast<unsigned char>(body.back())))) {
+    body.pop_back();
+  }
+  size_t start = 0;
+  while (start < body.size() && std::isspace(static_cast<unsigned char>(body[start]))) start++;
+  if (start > 0) body.erase(0, start);
+  if (body.empty() || body.front() != '{' || body.back() != '}') return false;
+  std::string file_name;
+  std::string file_extension;
+  std::string data_b64;
+  if (!parse_json_string_field(body, "fileName", file_name) || file_name.empty()) return false;
+  if (!parse_json_string_field(body, "fileExtension", file_extension) || file_extension.empty()) return false;
+  if (!parse_json_string_field(body, "data", data_b64) || data_b64.empty()) return false;
+  if (data_b64.find("base64,") != std::string::npos) return false;
   return true;
 }
 
@@ -475,6 +910,115 @@ static bool encode_beaglechat_file_payload(const std::string& filename,
   std::memcpy(out.data() + 4, meta_json.data(), meta_json.size());
   if (!data.empty()) std::memcpy(out.data() + 4 + meta_json.size(), data.data(), data.size());
   return true;
+}
+
+static std::string base64_encode_bytes(const std::vector<unsigned char>& data) {
+  static const char* kTable =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  out.reserve(((data.size() + 2) / 3) * 4);
+  size_t i = 0;
+  while (i + 3 <= data.size()) {
+    uint32_t n = (static_cast<uint32_t>(data[i]) << 16)
+               | (static_cast<uint32_t>(data[i + 1]) << 8)
+               | static_cast<uint32_t>(data[i + 2]);
+    out.push_back(kTable[(n >> 18) & 0x3F]);
+    out.push_back(kTable[(n >> 12) & 0x3F]);
+    out.push_back(kTable[(n >> 6) & 0x3F]);
+    out.push_back(kTable[n & 0x3F]);
+    i += 3;
+  }
+  size_t rem = data.size() - i;
+  if (rem == 1) {
+    uint32_t n = static_cast<uint32_t>(data[i]) << 16;
+    out.push_back(kTable[(n >> 18) & 0x3F]);
+    out.push_back(kTable[(n >> 12) & 0x3F]);
+    out.push_back('=');
+    out.push_back('=');
+  } else if (rem == 2) {
+    uint32_t n = (static_cast<uint32_t>(data[i]) << 16)
+               | (static_cast<uint32_t>(data[i + 1]) << 8);
+    out.push_back(kTable[(n >> 18) & 0x3F]);
+    out.push_back(kTable[(n >> 12) & 0x3F]);
+    out.push_back(kTable[(n >> 6) & 0x3F]);
+    out.push_back('=');
+  }
+  return out;
+}
+
+static bool encode_inline_json_media_payload(const std::string& filename,
+                                             const std::string& media_type,
+                                             const std::vector<unsigned char>& data,
+                                             std::string& out) {
+  if (filename.empty() || data.empty()) return false;
+  std::string mt = media_type.empty() ? infer_media_type_from_filename(filename) : media_type;
+  std::string type = lowercase(mt).rfind("image/", 0) == 0 ? "image" : "file";
+  std::string ext;
+  size_t dot = filename.find_last_of('.');
+  if (dot != std::string::npos && dot + 1 < filename.size()) {
+    ext = filename.substr(dot + 1);
+  }
+  std::string b64 = base64_encode_bytes(data);
+  if (b64.empty()) return false;
+  std::string data_url = "data:" + mt + ";base64," + b64;
+
+  std::ostringstream json;
+  json << "{"
+       << "\"type\":" << json_quote(type) << ","
+       << "\"fileName\":" << json_quote(filename) << ","
+       << "\"filename\":" << json_quote(filename) << ","
+       << "\"fileExtension\":" << json_quote(ext) << ","
+       << "\"mediaType\":" << json_quote(mt) << ","
+       << "\"data\":" << json_quote(data_url)
+       << "}";
+  out = json.str();
+  return !out.empty();
+}
+
+static bool encode_swift_filemodel_media_payload(const std::string& filename,
+                                                 const std::string& media_type,
+                                                 const std::vector<unsigned char>& data,
+                                                 std::string& out) {
+  if (filename.empty() || data.empty()) return false;
+  std::string stem = filename;
+  std::string ext = ".bin";
+  size_t dot = filename.find_last_of('.');
+  if (dot != std::string::npos && dot > 0 && dot + 1 < filename.size()) {
+    stem = filename.substr(0, dot);
+    ext = filename.substr(dot);
+  }
+  if (stem.empty()) stem = "file";
+  if (ext.empty() || ext[0] != '.') ext = "." + ext;
+  std::string mt = lowercase(media_type.empty() ? infer_media_type_from_filename(filename) : media_type);
+  std::string type = "unknown";
+  if (mt.rfind("image/", 0) == 0) type = "image";
+  else if (mt.rfind("audio/", 0) == 0) type = "audio";
+  else if (mt.rfind("text/", 0) == 0) type = "text";
+  std::string b64 = base64_encode_bytes(data);
+  if (b64.empty()) return false;
+
+  std::ostringstream json;
+  json << "{"
+       << "\"fileName\":" << json_quote(stem) << ","
+       << "\"fileExtension\":" << json_quote(ext) << ","
+       << "\"data\":" << json_quote(b64) << ","
+       << "\"type\":" << json_quote(type)
+       << "}";
+  out = json.str();
+  return !out.empty();
+}
+
+static bool encode_legacy_inline_data_payload(const std::vector<unsigned char>& data,
+                                              std::string& out) {
+  if (data.empty()) return false;
+  std::string b64 = base64_encode_bytes(data);
+  if (b64.empty()) return false;
+  std::ostringstream json;
+  json << "{"
+       << "\"data\":" << json_quote(b64)
+       << "}";
+  out = json.str();
+  return !out.empty();
 }
 
 static bool read_file(const std::string& path, std::string& out) {
@@ -724,7 +1268,11 @@ static std::string default_db_json() {
       + "  \"port\": 3306,\n"
       + "  \"user\": \"beagle\",\n"
       + "  \"password\": \"A1anSn00py\",\n"
-      + "  \"database\": \"beagle\"\n"
+      + "  \"database\": \"beagle\",\n"
+      + "  \"useCrawlerIndex\": false,\n"
+      + "  \"crawlerDataDir\": \"~/.elacrawler\",\n"
+      + "  \"crawlerRefreshSeconds\": 60,\n"
+      + "  \"crawlerLookbackFiles\": 20\n"
       + "}\n";
 }
 
@@ -769,6 +1317,13 @@ static void load_db_config(RuntimeState* state, DbConfig& db) {
   extract_json_string(body, "user", db.user);
   extract_json_string(body, "password", db.password);
   extract_json_string(body, "database", db.database);
+  extract_json_bool(body, "useCrawlerIndex", db.use_crawler_index);
+  extract_json_string(body, "crawlerDataDir", db.crawler_data_dir);
+  extract_json_int(body, "crawlerRefreshSeconds", db.crawler_refresh_seconds);
+  extract_json_int(body, "crawlerLookbackFiles", db.crawler_lookback_files);
+  if (db.crawler_refresh_seconds < 5) db.crawler_refresh_seconds = 5;
+  if (db.crawler_lookback_files < 1) db.crawler_lookback_files = 1;
+  if (db.crawler_lookback_files > 200) db.crawler_lookback_files = 200;
 }
 
 static void load_welcomed_peers(RuntimeState* state) {
@@ -879,6 +1434,108 @@ static int mysql_exec(const DbConfig& db, const std::string& sql) {
   return rc;
 }
 
+static bool mysql_query_has_rows(const DbConfig& db, const std::string& sql) {
+  if (!db.enabled) return false;
+  std::ostringstream cmd;
+  cmd << "mysql --batch --skip-column-names --raw --protocol=TCP"
+      << " --host=" << shell_escape(db.host)
+      << " --port=" << db.port
+      << " --user=" << shell_escape(db.user)
+      << " --password=" << shell_escape(db.password);
+  if (!db.database.empty()) cmd << " --database=" << shell_escape(db.database);
+  cmd << " --execute=" << shell_escape(sql) << " 2>/dev/null";
+  FILE* fp = popen(cmd.str().c_str(), "r");
+  if (!fp) return false;
+  char line[64];
+  bool has = std::fgets(line, sizeof(line), fp) != nullptr;
+  pclose(fp);
+  return has;
+}
+
+static bool mysql_query_first_line(const DbConfig& db,
+                                   const std::string& sql,
+                                   std::string& out_line) {
+  if (!db.enabled) return false;
+  std::ostringstream cmd;
+  cmd << "mysql --batch --skip-column-names --raw --protocol=TCP"
+      << " --host=" << shell_escape(db.host)
+      << " --port=" << db.port
+      << " --user=" << shell_escape(db.user)
+      << " --password=" << shell_escape(db.password);
+  if (!db.database.empty()) cmd << " --database=" << shell_escape(db.database);
+  cmd << " --execute=" << shell_escape(sql) << " 2>/dev/null";
+  FILE* fp = popen(cmd.str().c_str(), "r");
+  if (!fp) return false;
+  char line[1024];
+  bool ok = std::fgets(line, sizeof(line), fp) != nullptr;
+  pclose(fp);
+  if (!ok) return false;
+  out_line = line;
+  while (!out_line.empty() && (out_line.back() == '\n' || out_line.back() == '\r')) {
+    out_line.pop_back();
+  }
+  return !out_line.empty();
+}
+
+static bool mysql_column_exists(const DbConfig& db,
+                                const std::string& table,
+                                const std::string& column) {
+  std::ostringstream sql;
+  sql << "SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA='"
+      << sql_escape(db.database) << "' AND TABLE_NAME='"
+      << sql_escape(table) << "' AND COLUMN_NAME='"
+      << sql_escape(column) << "' LIMIT 1;";
+  return mysql_query_has_rows(db, sql.str());
+}
+
+static void persist_crawler_index_to_db(RuntimeState* state,
+                                        const std::map<std::string, std::pair<std::string, std::string>>& rows,
+                                        const std::string& source_file,
+                                        std::time_t seen_at) {
+  if (!state || !state->db.enabled || rows.empty()) return;
+  std::ostringstream sql;
+  sql << "REPLACE INTO beagle_crawler_node_cache(userid,ip,location,source_file,seen_at,updated_at) VALUES ";
+  bool first = true;
+  for (const auto& kv : rows) {
+    const std::string& userid = kv.first;
+    const std::string& ip = kv.second.first;
+    const std::string& location = kv.second.second;
+    if (userid.empty()) continue;
+    if (!first) sql << ",";
+    first = false;
+    sql << "('"
+        << sql_escape(userid) << "','"
+        << sql_escape(ip) << "','"
+        << sql_escape(location) << "','"
+        << sql_escape(source_file) << "',"
+        << "FROM_UNIXTIME(" << static_cast<long long>(seen_at) << "),"
+        << "NOW())";
+  }
+  if (first) return;
+  sql << ";";
+  int rc = mysql_exec(state->db, sql.str());
+  if (rc != 0) {
+    log_line("[beagle-sdk] crawler cache persist failed rc=" + std::to_string(rc));
+  } else {
+    log_line("[beagle-sdk] crawler cache persisted rows=" + std::to_string(rows.size()));
+  }
+}
+
+static std::pair<std::string, std::string> lookup_ip_location_from_crawler_cache_db(RuntimeState* state,
+                                                                                     const std::string& friendid) {
+  if (!state || !state->db.enabled || friendid.empty()) return {"", ""};
+  std::ostringstream sql;
+  sql << "SELECT ip,location FROM beagle_crawler_node_cache WHERE userid='"
+      << sql_escape(friendid) << "' LIMIT 1;";
+  std::string line;
+  if (!mysql_query_first_line(state->db, sql.str(), line)) return {"", ""};
+  size_t tab = line.find('\t');
+  if (tab == std::string::npos) return {"", ""};
+  std::string ip = line.substr(0, tab);
+  std::string location = line.substr(tab + 1);
+  return {ip, location};
+}
+
 static void ensure_db(RuntimeState* state, const DbConfig& db) {
   if (!state || !db.enabled) return;
   std::string create_db = "CREATE DATABASE IF NOT EXISTS " + db.database + ";";
@@ -927,11 +1584,28 @@ static void ensure_db(RuntimeState* state, const DbConfig& db) {
       "event_type VARCHAR(32),"
       "status INT,"
       "presence INT,"
+      "ip VARCHAR(64),"
+      "location VARCHAR(128),"
       "ts DATETIME"
+      ");"
+      "CREATE TABLE IF NOT EXISTS beagle_crawler_node_cache ("
+      "userid VARCHAR(128) PRIMARY KEY,"
+      "ip VARCHAR(64),"
+      "location VARCHAR(128),"
+      "source_file VARCHAR(255),"
+      "seen_at DATETIME,"
+      "updated_at DATETIME,"
+      "KEY idx_seen_at (seen_at)"
       ");";
   int rc = mysql_exec(db, schema);
   if (rc != 0) {
     log_line(std::string("[beagle-sdk] mysql schema init failed rc=") + std::to_string(rc));
+  }
+  if (!mysql_column_exists(db, "beagle_friend_events", "ip")) {
+    mysql_exec(db, "ALTER TABLE beagle_friend_events ADD COLUMN ip VARCHAR(64) NULL AFTER presence;");
+  }
+  if (!mysql_column_exists(db, "beagle_friend_events", "location")) {
+    mysql_exec(db, "ALTER TABLE beagle_friend_events ADD COLUMN location VARCHAR(128) NULL AFTER ip;");
   }
 }
 
@@ -950,19 +1624,36 @@ static void log_friend_event(RuntimeState* state,
                              int status,
                              int presence) {
   std::string ts = now_mysql_ts();
+  std::string ip;
+  std::string location;
+  if (state->db.use_crawler_index) {
+    auto resolved = lookup_ip_location_from_crawler(state, friendid);
+    ip = resolved.first;
+    location = resolved.second;
+    if (!ip.empty() && location.empty()) {
+      location = guess_location_from_ip(ip);
+    }
+  } else {
+    ip = detect_remote_ip_for_current_process();
+    location = guess_location_from_ip(ip);
+  }
   if (!state->friend_event_log_path.empty()) {
     std::ostringstream line;
     line << ts << "\t" << friendid << "\t" << event_type
-         << "\tstatus=" << status << "\tpresence=" << presence;
+         << "\tstatus=" << status << "\tpresence=" << presence
+         << "\tip=" << (ip.empty() ? "-" : ip)
+         << "\tlocation=" << (location.empty() ? "-" : location);
     append_line(state->friend_event_log_path, line.str());
   }
   if (state->db.enabled) {
     std::ostringstream sql;
-    sql << "INSERT INTO beagle_friend_events(friendid,event_type,status,presence,ts) VALUES('"
+    sql << "INSERT INTO beagle_friend_events(friendid,event_type,status,presence,ip,location,ts) VALUES('"
         << sql_escape(friendid) << "','"
         << sql_escape(event_type) << "',"
         << status << ","
         << presence << ",'"
+        << sql_escape(ip) << "','"
+        << sql_escape(location) << "','"
         << sql_escape(ts) << "');";
     mysql_exec(state->db, sql.str());
   }
@@ -1068,11 +1759,26 @@ static void update_friend_status(RuntimeState* state,
   int next_presence = presence >= 0 ? presence : it->second.presence;
   bool changed = (it->second.status != next_status);
   bool presence_changed = (it->second.presence != next_presence);
-  if (!changed && !presence_changed) return;
+  if (!changed && !presence_changed) {
+    if (log_event) {
+      log_friend_event(state, friendid, next_status ? "online" : "offline", next_status, next_presence);
+    }
+    return;
+  }
   it->second.status = next_status;
   it->second.presence = next_presence;
   save_friend_state(state);
   if (log_event && changed) log_friend_event(state, friendid, next_status ? "online" : "offline", next_status, next_presence);
+}
+
+static bool is_friend_online(RuntimeState* state, const std::string& friendid, bool& known) {
+  known = false;
+  if (!state || friendid.empty()) return false;
+  std::lock_guard<std::mutex> lock(state->state_mu);
+  auto it = state->friend_state.find(friendid);
+  if (it == state->friend_state.end()) return false;
+  known = true;
+  return it->second.status != 0;
 }
 
 static void apply_profile(RuntimeState* state, const ProfileInfo& profile) {
@@ -1184,9 +1890,37 @@ static void filetransfer_state_changed_callback(CarrierFileTransfer* ft,
   auto ctx = get_transfer(ft);
   if (!ctx) return;
   ctx->connected = (state == FileTransferConnection_connected);
+  std::string state_name = "unknown";
+  if (state == FileTransferConnection_initialized) state_name = "initialized";
+  else if (state == FileTransferConnection_connecting) state_name = "connecting";
+  else if (state == FileTransferConnection_connected) state_name = "connected";
+  else if (state == FileTransferConnection_closed) state_name = "closed";
+  else if (state == FileTransferConnection_failed) state_name = "failed";
+  log_line(std::string("[beagle-sdk] filetransfer state ")
+           + state_name
+           + " peer=" + ctx->peer
+           + " file=" + ctx->filename
+           + " sender=" + (ctx->is_sender ? "1" : "0"));
 
   if (state == FileTransferConnection_connected && !ctx->is_sender && !ctx->fileid.empty()) {
     carrier_filetransfer_pull(ft, ctx->fileid.c_str(), 0);
+  }
+  if (ctx->is_sender) {
+    if (state == FileTransferConnection_connected) {
+      std::lock_guard<std::mutex> lock(ctx->connect_mu);
+      ctx->connect_done = true;
+      ctx->connect_ok = true;
+      ctx->connect_cv.notify_all();
+    } else if (state == FileTransferConnection_failed || state == FileTransferConnection_closed) {
+      std::lock_guard<std::mutex> lock(ctx->connect_mu);
+      if (!ctx->connect_done) {
+        ctx->connect_done = true;
+        ctx->connect_ok = false;
+        ctx->connect_cv.notify_all();
+      }
+      std::string reason = (state == FileTransferConnection_failed) ? "state_failed" : "state_closed";
+      mark_sender_transfer_result(ctx, false, reason);
+    }
   }
 
   if (state == FileTransferConnection_closed || state == FileTransferConnection_failed) {
@@ -1227,6 +1961,7 @@ static void filetransfer_pull_callback(CarrierFileTransfer* ft,
   if (!ctx->source.is_open()) {
     ctx->source.open(ctx->source_path, std::ios::binary);
     if (!ctx->source) {
+      mark_sender_transfer_result(ctx, false, "open_source_failed");
       carrier_filetransfer_cancel(ft, ctx->fileid.c_str(), -1, "open source failed");
       return;
     }
@@ -1234,27 +1969,47 @@ static void filetransfer_pull_callback(CarrierFileTransfer* ft,
   ctx->source.clear();
   ctx->source.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
   if (!ctx->source.good()) {
+    mark_sender_transfer_result(ctx, false, "seek_source_failed");
     carrier_filetransfer_cancel(ft, ctx->fileid.c_str(), -1, "seek source failed");
     return;
   }
 
-  char buf[64 * 1024];
+  uint8_t buf[CARRIER_MAX_USER_DATA_LEN];
   while (ctx->source.good()) {
-    ctx->source.read(buf, sizeof(buf));
+    ctx->source.read(reinterpret_cast<char*>(buf), sizeof(buf));
     std::streamsize got = ctx->source.gcount();
     if (got <= 0) break;
-    ssize_t sent = carrier_filetransfer_send(ft,
-                                             ctx->fileid.c_str(),
-                                             reinterpret_cast<const uint8_t*>(buf),
-                                             static_cast<size_t>(got));
-    if (sent < 0) {
-      carrier_filetransfer_cancel(ft, ctx->fileid.c_str(), -1, "send chunk failed");
-      return;
+    size_t off = 0;
+    size_t total = static_cast<size_t>(got);
+    while (off < total) {
+      size_t chunk = total - off;
+      if (chunk > CARRIER_MAX_USER_DATA_LEN) chunk = CARRIER_MAX_USER_DATA_LEN;
+      ssize_t sent = carrier_filetransfer_send(ft,
+                                               ctx->fileid.c_str(),
+                                               buf + off,
+                                               chunk);
+      if (sent < 0) {
+        mark_sender_transfer_result(ctx, false, "send_chunk_failed");
+        carrier_filetransfer_cancel(ft, ctx->fileid.c_str(), -1, "send chunk failed");
+        return;
+      }
+      if (sent == 0) {
+        mark_sender_transfer_result(ctx, false, "send_chunk_zero");
+        carrier_filetransfer_cancel(ft, ctx->fileid.c_str(), -1, "send chunk returned zero");
+        return;
+      }
+      off += static_cast<size_t>(sent);
+      ctx->transferred += static_cast<uint64_t>(sent);
     }
-    ctx->transferred += static_cast<uint64_t>(sent);
   }
 
-  carrier_filetransfer_send(ft, ctx->fileid.c_str(), nullptr, 0);
+  ssize_t finish_rc = carrier_filetransfer_send(ft, ctx->fileid.c_str(), nullptr, 0);
+  if (finish_rc < 0) {
+    mark_sender_transfer_result(ctx, false, "send_finish_failed");
+    carrier_filetransfer_cancel(ft, ctx->fileid.c_str(), -1, "send finish failed");
+    return;
+  }
+  mark_sender_transfer_result(ctx, true, "send_complete");
 }
 
 static bool filetransfer_data_callback(CarrierFileTransfer* ft,
@@ -1311,6 +2066,7 @@ static void filetransfer_cancel_callback(CarrierFileTransfer* ft,
   log_line(msg.str());
   auto ctx = take_transfer(ft);
   if (!ctx) return;
+  mark_sender_transfer_result(ctx, false, std::string("canceled:") + (reason ? reason : ""));
   if (ctx->source.is_open()) ctx->source.close();
   if (ctx->target.is_open()) ctx->target.close();
   carrier_filetransfer_close(ft);
@@ -1327,6 +2083,90 @@ static CarrierFileTransferCallbacks build_filetransfer_callbacks() {
   cbs.resume = filetransfer_resume_callback;
   cbs.cancel = filetransfer_cancel_callback;
   return cbs;
+}
+
+static bool send_media_via_filetransfer(RuntimeState* state,
+                                        const std::string& peer,
+                                        const std::string& media_path,
+                                        const std::string& send_filename,
+                                        const std::string& send_media_type,
+                                        uint64_t expected_size,
+                                        int wait_connect_ms,
+                                        int wait_transfer_ms,
+                                        std::string& detail) {
+  if (!state || !state->carrier) {
+    detail = "carrier_not_ready";
+    return false;
+  }
+  if (peer.empty() || media_path.empty() || send_filename.empty()) {
+    detail = "invalid_args";
+    return false;
+  }
+
+  auto ctx = std::make_shared<TransferContext>();
+  ctx->state = state;
+  ctx->is_sender = true;
+  ctx->peer = peer;
+  ctx->source_path = media_path;
+  ctx->filename = send_filename;
+  ctx->media_type = send_media_type;
+  ctx->expected_size = expected_size;
+
+  CarrierFileTransferInfo info;
+  std::memset(&info, 0, sizeof(info));
+  std::snprintf(info.filename, sizeof(info.filename), "%s", send_filename.c_str());
+  info.size = expected_size;
+  if (!carrier_filetransfer_fileid(info.fileid, sizeof(info.fileid))) {
+    detail = "fileid_generate_failed";
+    return false;
+  }
+  ctx->fileid = info.fileid;
+
+  CarrierFileTransferCallbacks cbs = build_filetransfer_callbacks();
+  ctx->ft = carrier_filetransfer_new(state->carrier, peer.c_str(), &info, &cbs, ctx.get());
+  if (!ctx->ft) {
+    std::ostringstream oss;
+    oss << "new_failed:0x" << std::hex << carrier_get_error() << std::dec;
+    detail = oss.str();
+    return false;
+  }
+  register_transfer(ctx);
+
+  if (carrier_filetransfer_connect(ctx->ft) < 0) {
+    std::ostringstream oss;
+    oss << "connect_failed:0x" << std::hex << carrier_get_error() << std::dec;
+    detail = oss.str();
+    take_transfer(ctx->ft);
+    carrier_filetransfer_close(ctx->ft);
+    return false;
+  }
+
+  std::unique_lock<std::mutex> lock(ctx->connect_mu);
+  bool done = ctx->connect_cv.wait_for(lock,
+                                       std::chrono::milliseconds(wait_connect_ms),
+                                       [&]() { return ctx->connect_done; });
+  if (!done) {
+    detail = "connect_timeout";
+    return false;
+  }
+  if (!ctx->connect_ok) {
+    detail = "connect_not_ok";
+    return false;
+  }
+  std::unique_lock<std::mutex> transfer_lock(ctx->transfer_mu);
+  bool transfer_done = ctx->transfer_cv.wait_for(transfer_lock,
+                                                 std::chrono::milliseconds(wait_transfer_ms),
+                                                 [&]() { return ctx->transfer_done; });
+  if (!transfer_done) {
+    detail = "send_timeout";
+    return false;
+  }
+  if (!ctx->transfer_ok) {
+    detail = ctx->transfer_detail.empty() ? "send_not_ok" : ctx->transfer_detail;
+    return false;
+  }
+  detail = ctx->transfer_detail.empty() ? "send_complete" : ctx->transfer_detail;
+  return true;
 }
 
 static void filetransfer_connect_callback(Carrier* carrier,
@@ -1394,6 +2234,11 @@ void friend_message_callback(Carrier* carrier,
   incoming.peer = from ? from : "";
   PackedFilePayload file_payload;
   if (decode_beaglechat_file_payload(msg, len, file_payload)) {
+    {
+      std::lock_guard<std::mutex> lock(state->state_mu);
+      state->peer_prefers_inline_media[incoming.peer] = false;
+      state->peer_media_payload_hint[incoming.peer] = "packed";
+    }
     if (file_payload.bytes_len > kMaxBeaglechatFileBytes) {
       incoming.filename = file_payload.filename;
       incoming.media_type = file_payload.content_type;
@@ -1428,6 +2273,12 @@ void friend_message_callback(Carrier* carrier,
   } else {
     InlineJsonMedia inline_media;
     if (decode_inline_json_media_payload(msg, len, inline_media)) {
+      {
+        std::lock_guard<std::mutex> lock(state->state_mu);
+        state->peer_prefers_inline_media[incoming.peer] = true;
+        state->peer_media_payload_hint[incoming.peer] =
+            is_swift_filemodel_json_payload(msg, len) ? "swift-json" : "inline-json";
+      }
       ensure_dir(state->media_dir);
       std::ostringstream path;
       path << state->media_dir << "/" << std::time(nullptr) << "_" << inline_media.filename;
@@ -1711,6 +2562,9 @@ bool BeagleSdk::start(const BeagleSdkOptions& options, BeagleIncomingCallback on
 
   load_db_config(&g_state, g_state.db);
   ensure_db(&g_state, g_state.db);
+  if (g_state.db.use_crawler_index) {
+    refresh_crawler_index_if_needed(&g_state);
+  }
   load_friend_state(&g_state);
 
   g_state.loop_thread = std::thread([]() {
@@ -1753,8 +2607,23 @@ bool BeagleSdk::send_text(const std::string& peer, const std::string& text) {
                                        nullptr,
                                        nullptr);
   if (rc < 0) {
+    int err = carrier_get_error();
+    std::string detail;
+    if (post_payload_to_express_node(&g_state, peer, text.data(), text.size(), detail)) {
+      log_line(std::string("[beagle-sdk] send_text express fallback ok peer=")
+               + peer + " bytes=" + std::to_string(text.size())
+               + " detail=" + detail
+               + " carrier_err=0x" + [&]() {
+                   std::ostringstream oss;
+                   oss << std::hex << err;
+                   return oss.str();
+                 }());
+      return true;
+    }
+    log_line(std::string("[beagle-sdk] send_text express fallback failed peer=")
+             + peer + " detail=" + detail);
     std::ostringstream msg;
-    msg << "[beagle-sdk] send_text failed: 0x" << std::hex << carrier_get_error() << std::dec;
+    msg << "[beagle-sdk] send_text failed: 0x" << std::hex << err << std::dec;
     log_line(msg.str());
     return false;
   }
@@ -1767,7 +2636,8 @@ bool BeagleSdk::send_media(const std::string& peer,
                            const std::string& media_path,
                            const std::string& media_url,
                            const std::string& media_type,
-                           const std::string& filename) {
+                           const std::string& filename,
+                           const std::string& out_format) {
   if (!g_state.carrier) return false;
 
   if (media_path.empty()) {
@@ -1794,7 +2664,10 @@ bool BeagleSdk::send_media(const std::string& peer,
     return false;
   }
   std::string send_filename = sanitize_filename(!filename.empty() ? filename : basename_of(media_path));
+  if (send_filename.empty()) send_filename = "file.bin";
   std::string send_media_type = !media_type.empty() ? media_type : infer_media_type_from_filename(send_filename);
+  uint64_t expected_size = static_cast<uint64_t>(size);
+
   std::vector<unsigned char> file_bytes;
   if (!read_file_binary(media_path, file_bytes)) {
     log_line(std::string("[beagle-sdk] send_media failed to read file: ") + media_path);
@@ -1807,37 +2680,207 @@ bool BeagleSdk::send_media(const std::string& peer,
     return false;
   }
 
-  std::vector<unsigned char> payload;
-  if (!encode_beaglechat_file_payload(send_filename, send_media_type, file_bytes, payload)) {
-    log_line("[beagle-sdk] send_media failed to pack beaglechat payload");
-    return false;
+  std::string out_mode = lowercase(trim_copy(out_format));
+  if (out_mode.empty()) {
+    const char* mode_env = std::getenv("BEAGLE_MEDIA_OUT_FORMAT");
+    out_mode = lowercase(trim_copy(mode_env ? mode_env : ""));
+  }
+  if (out_mode.empty()) out_mode = "auto";
+  if (!out_mode.empty() &&
+      out_mode != "auto" &&
+      out_mode != "filetransfer" &&
+      out_mode != "packed" &&
+      out_mode != "swift-json" &&
+      out_mode != "inline-json" &&
+      out_mode != "legacy-inline") {
+    out_mode = "auto";
+  }
+  bool force_filetransfer = (out_mode == "filetransfer");
+  bool try_filetransfer_first = (out_mode == "auto" || force_filetransfer);
+  bool use_packed = (out_mode == "packed" || out_mode == "auto");
+  bool use_swift_json = (out_mode == "swift-json");
+  bool use_legacy_inline = (out_mode == "legacy-inline");
+  bool prefer_message_media_path = false;
+  log_line(std::string("[beagle-sdk] send_media mode peer=") + peer
+           + " out_mode=" + out_mode
+           + " force_filetransfer=" + (force_filetransfer ? "1" : "0")
+           + " try_filetransfer_first=" + (try_filetransfer_first ? "1" : "0")
+           + " use_packed=" + (use_packed ? "1" : "0")
+           + " use_swift_json=" + (use_swift_json ? "1" : "0")
+           + " use_legacy_inline=" + (use_legacy_inline ? "1" : "0"));
+  const char* legacy_peers_env = std::getenv("BEAGLE_MEDIA_LEGACY_INLINE_PEERS");
+  if (legacy_peers_env && csv_has_token(legacy_peers_env, peer)) {
+    use_legacy_inline = true;
+    use_packed = false;
+    use_swift_json = false;
+  }
+  const char* swift_peers_env = std::getenv("BEAGLE_MEDIA_SWIFT_JSON_PEERS");
+  if (swift_peers_env && csv_has_token(swift_peers_env, peer)) {
+    use_packed = false;
+    use_swift_json = true;
+    use_legacy_inline = false;
+  }
+  const char* inline_peers_env = std::getenv("BEAGLE_MEDIA_INLINE_PEERS");
+  if (inline_peers_env && csv_has_token(inline_peers_env, peer)) {
+    use_packed = false;
+    use_swift_json = false;
+    use_legacy_inline = false;
+  }
+  if (out_mode == "auto") {
+    std::lock_guard<std::mutex> lock(g_state.state_mu);
+    auto it = g_state.peer_media_payload_hint.find(peer);
+    if (it != g_state.peer_media_payload_hint.end()) {
+      if (it->second == "swift-json") {
+        use_packed = false;
+        use_swift_json = true;
+        use_legacy_inline = false;
+        prefer_message_media_path = true;
+      } else if (it->second == "inline-json") {
+        use_packed = false;
+        use_swift_json = false;
+        use_legacy_inline = false;
+        prefer_message_media_path = true;
+      } else if (it->second == "packed") {
+        use_packed = true;
+        use_swift_json = false;
+        use_legacy_inline = false;
+      }
+    }
   }
 
-  if (!caption.empty()) {
-    send_text(peer, caption);
+  if (out_mode == "auto" && prefer_message_media_path && !force_filetransfer) {
+    try_filetransfer_first = false;
+    log_line(std::string("[beagle-sdk] send_media auto prefers message media payload for peer=") + peer);
+  }
+
+  bool peer_online_known = false;
+  bool peer_online = is_friend_online(&g_state, peer, peer_online_known);
+  if (try_filetransfer_first && peer_online_known && !peer_online) {
+    if (force_filetransfer) {
+      log_line(std::string("[beagle-sdk] send_media filetransfer-only mode but peer offline: ") + peer);
+      return false;
+    }
+    try_filetransfer_first = false;
+    log_line(std::string("[beagle-sdk] send_media skipping filetransfer because peer offline: ") + peer);
+  }
+
+  if (try_filetransfer_first) {
+    log_line(std::string("[beagle-sdk] send_media trying filetransfer peer=") + peer
+             + " file=" + send_filename);
+    std::string ft_detail;
+    int wait_ms = 8000;
+    const char* wait_env = std::getenv("BEAGLE_FILETRANSFER_WAIT_MS");
+    if (wait_env && *wait_env) {
+      int v = std::atoi(wait_env);
+      if (v >= 1000 && v <= 60000) wait_ms = v;
+    }
+    int wait_send_ms = 15000;
+    const char* wait_send_env = std::getenv("BEAGLE_FILETRANSFER_SEND_WAIT_MS");
+    if (wait_send_env && *wait_send_env) {
+      int v = std::atoi(wait_send_env);
+      if (v >= 1000 && v <= 120000) wait_send_ms = v;
+    }
+    if (send_media_via_filetransfer(&g_state,
+                                    peer,
+                                    media_path,
+                                    send_filename,
+                                    send_media_type,
+                                    expected_size,
+                                    wait_ms,
+                                    wait_send_ms,
+                                    ft_detail)) {
+      log_line(std::string("[beagle-sdk] send_media(filetransfer) ok peer=")
+               + peer + " file=" + send_filename
+               + " size=" + std::to_string(size)
+               + " type=" + send_media_type
+               + " detail=" + ft_detail);
+      return true;
+    }
+    log_line(std::string("[beagle-sdk] send_media(filetransfer) failed peer=")
+             + peer + " file=" + send_filename
+             + " detail=" + ft_detail);
+    if (force_filetransfer) return false;
+  }
+
+  std::vector<unsigned char> payload_packed;
+  std::string payload_inline;
+  const void* payload_ptr = nullptr;
+  size_t payload_len = 0;
+  std::string payload_mode = "inline-json";
+
+  if (use_packed) {
+    if (!encode_beaglechat_file_payload(send_filename, send_media_type, file_bytes, payload_packed)) {
+      log_line("[beagle-sdk] send_media failed to pack beaglechat payload");
+      return false;
+    }
+    payload_ptr = payload_packed.data();
+    payload_len = payload_packed.size();
+    payload_mode = "packed";
+  } else {
+    if (use_legacy_inline) {
+      if (!encode_legacy_inline_data_payload(file_bytes, payload_inline)) {
+        log_line("[beagle-sdk] send_media failed to encode legacy inline data payload");
+        return false;
+      }
+      payload_mode = "legacy-inline";
+    } else if (use_swift_json) {
+      if (!encode_swift_filemodel_media_payload(send_filename, send_media_type, file_bytes, payload_inline)) {
+        log_line("[beagle-sdk] send_media failed to encode swift filemodel payload");
+        return false;
+      }
+      payload_mode = "swift-json";
+    } else {
+      if (!encode_inline_json_media_payload(send_filename, send_media_type, file_bytes, payload_inline)) {
+        log_line("[beagle-sdk] send_media failed to encode inline json media payload");
+        return false;
+      }
+      payload_mode = "inline-json";
+    }
+    payload_ptr = payload_inline.data();
+    payload_len = payload_inline.size();
   }
 
   uint32_t msgid = 0;
   int rc = carrier_send_friend_message(g_state.carrier,
                                        peer.c_str(),
-                                       payload.data(),
-                                       payload.size(),
+                                       payload_ptr,
+                                       payload_len,
                                        &msgid,
                                        nullptr,
                                        nullptr);
   if (rc < 0) {
+    int err = carrier_get_error();
+    std::string detail;
+    if (post_payload_to_express_node(&g_state, peer, payload_ptr, payload_len, detail)) {
+      log_line(std::string("[beagle-sdk] send_media(") + payload_mode
+               + ") express fallback ok peer="
+               + peer + " file=" + send_filename
+               + " bytes=" + std::to_string(payload_len)
+               + " detail=" + detail
+               + " carrier_err=0x" + [&]() {
+                   std::ostringstream oss;
+                   oss << std::hex << err;
+                   return oss.str();
+                 }());
+      return true;
+    }
+    log_line(std::string("[beagle-sdk] send_media(") + payload_mode
+             + ") express fallback failed peer="
+             + peer + " file=" + send_filename + " detail=" + detail);
     std::ostringstream msg;
-    msg << "[beagle-sdk] send_media(beaglechat payload) failed: 0x" << std::hex
-        << carrier_get_error() << std::dec;
+    msg << "[beagle-sdk] send_media(" << payload_mode
+        << ") failed: 0x" << std::hex
+        << err << std::dec;
     log_line(msg.str());
     return false;
   }
-
-  log_line(std::string("[beagle-sdk] send_media(beaglechat payload) ok msgid=")
+  log_line(std::string("[beagle-sdk] send_media(") + payload_mode
+           + ") ok msgid="
            + std::to_string(msgid)
            + " peer=" + peer
            + " file=" + send_filename
-           + " size=" + std::to_string(size));
+           + " size=" + std::to_string(size)
+           + " type=" + send_media_type);
   return true;
 }
 

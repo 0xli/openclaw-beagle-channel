@@ -43,7 +43,8 @@ public:
                   const std::string& media_path,
                   const std::string& media_url,
                   const std::string& media_type,
-                  const std::string& filename);
+                  const std::string& filename,
+                  const std::string& out_format = "");
 
   const std::string& userid() const { return user_id_; }
   const std::string& address() const { return address_; }

@@ -53,6 +53,7 @@ Status and logs:
 ```bash
 ./start.sh --status-systemd-user
 scripts/setup-systemd-user.sh logs
+scripts/setup-systemd-user.sh logs --follow
 ```
 
 Uninstall:
@@ -66,6 +67,32 @@ To keep it running after logout, you may need:
 ```bash
 loginctl enable-linger "$USER"
 ```
+
+## Crawler Service (userid -> ip/location)
+
+Install and start crawler as a user service:
+
+```bash
+scripts/setup-crawler-systemd-user.sh install
+```
+
+Status and logs:
+
+```bash
+scripts/setup-crawler-systemd-user.sh status
+scripts/setup-crawler-systemd-user.sh logs
+scripts/setup-crawler-systemd-user.sh logs --follow
+```
+
+If you change sidecar bootstraps and want crawler to pick them up:
+
+```bash
+scripts/setup-crawler-systemd-user.sh sync-config
+systemctl --user restart elacrawler.service
+```
+
+`sync-config` preserves existing crawler bootnodes and appends any missing bootnodes from `BEAGLE_SDK_ROOT/config/carrier.conf`.
+Crawler does not support `express_nodes`; only `bootstraps` are synced.
 
 ## Profile + Welcome Config
 
@@ -104,15 +131,22 @@ Default contents:
   "port": 3306,
   "user": "beagle",
   "password": "A1anSn00py",
-  "database": "beagle"
+  "database": "beagle",
+  "useCrawlerIndex": false,
+  "crawlerDataDir": "~/.elacrawler",
+  "crawlerRefreshSeconds": 60,
+  "crawlerLookbackFiles": 20
 }
 ```
+
+Set `"useCrawlerIndex": true` to resolve `ip`/`location` from crawler output files.
 
 When enabled, the sidecar creates/uses:
 
 - `beagle_friend_info` (current info)
 - `beagle_friend_info_history` (changes over time)
-- `beagle_friend_events` (online/offline events)
+- `beagle_friend_events` (online/offline events, with crawler-derived `ip` and `location`)
+- `beagle_crawler_node_cache` (persistent `userid -> ip/location` cache from crawler `.lst`)
 
 ## HTTP API
 
