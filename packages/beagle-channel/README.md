@@ -13,7 +13,10 @@ This package provides a Beagle Chat channel plugin for OpenClaw. It connects to 
         "default": {
           "enabled": true,
           "sidecarBaseUrl": "http://127.0.0.1:39091",
-          "authToken": "devtoken"
+          "authToken": "devtoken",
+          "trustedGroupPeers": ["aHzsSg...6377"],
+          "trustedGroupAddresses": ["E9kgtc...REP6"],
+          "requireTrustedGroup": false
         }
       }
     }
@@ -49,8 +52,10 @@ Restart OpenClaw after installing.
 ## Supported Features
 
 - Direct chats
+- CarrierGroup forwarded group chats (`CGP1` inbound parsing)
 - Text messages
 - Media (images/files) via `sendMedia`
+- Group-context replies encoded as `CGR1` envelope back to CarrierGroup
 
 ## Development
 

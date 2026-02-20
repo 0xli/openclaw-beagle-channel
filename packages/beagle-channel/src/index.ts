@@ -9,6 +9,124 @@ const INBOUND_SEEN_MAX = 10_000;
 const inboundSeen = new Set<string>();
 const inboundSeenOrder: string[] = [];
 const inboundPollControllers = new Set<AbortController>();
+const CARRIER_GROUP_MESSAGE_PREFIX = "CGP1 ";
+const CARRIER_GROUP_REPLY_PREFIX = "CGR1 ";
+
+type CarrierGroupInboundEnvelope = {
+  type?: string;
+  version?: number;
+  chat_type?: string;
+  source?: string;
+  group?: {
+    userid?: string;
+    address?: string;
+    nickname?: string;
+  };
+  origin?: {
+    userid?: string;
+    friendid?: string;
+    nickname?: string;
+    user_info?: {
+      userid?: string;
+      name?: string;
+      description?: string;
+      has_avatar?: number;
+      gender?: string;
+      phone?: string;
+      email?: string;
+      region?: string;
+    };
+    friend_info?: {
+      label?: string;
+      status?: number;
+      status_text?: string;
+      presence?: number;
+      presence_text?: string;
+    };
+  };
+  message?: {
+    text?: string;
+    timestamp?: number;
+  };
+  render?: {
+    plain?: string;
+  };
+  text?: string;
+};
+
+type ParsedGroupInbound = {
+  envelope: CarrierGroupInboundEnvelope;
+  groupUserId: string;
+  groupAddress: string;
+  groupNickname: string;
+  originUserId: string;
+  originNickname: string;
+  messageText: string;
+  timestamp?: number;
+};
+
+function parseCarrierGroupInbound(rawText: any): ParsedGroupInbound | null {
+  const raw = String(rawText ?? "");
+  if (!raw.startsWith(CARRIER_GROUP_MESSAGE_PREFIX)) return null;
+  const payloadText = raw.slice(CARRIER_GROUP_MESSAGE_PREFIX.length).trim();
+  if (!payloadText) return null;
+
+  let parsed: CarrierGroupInboundEnvelope;
+  try {
+    parsed = JSON.parse(payloadText) as CarrierGroupInboundEnvelope;
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  if (String(parsed.type ?? "") !== "carrier_group_message") return null;
+  if (String(parsed.chat_type ?? "") && String(parsed.chat_type ?? "") !== "group") return null;
+
+  const groupUserId = String(parsed.group?.userid ?? "").trim();
+  const groupAddress = String(parsed.group?.address ?? "").trim();
+  const groupNickname = String(parsed.group?.nickname ?? "").trim();
+  const originUserId = String(
+    parsed.origin?.userid ?? parsed.origin?.friendid ?? parsed.origin?.user_info?.userid ?? ""
+  ).trim();
+  const originNickname = String(
+    parsed.origin?.nickname ?? parsed.origin?.user_info?.name ?? ""
+  ).trim();
+  const messageText = String(parsed.message?.text ?? parsed.text ?? "").trim();
+  const timestampNum = Number(parsed.message?.timestamp ?? 0);
+  const timestamp = Number.isFinite(timestampNum) && timestampNum > 0 ? timestampNum : undefined;
+
+  if (!groupAddress || !originUserId || !messageText) return null;
+
+  return {
+    envelope: parsed,
+    groupUserId,
+    groupAddress,
+    groupNickname,
+    originUserId,
+    originNickname,
+    messageText,
+    timestamp
+  };
+}
+
+function buildCarrierGroupReplyText(text: string, parsedGroup: ParsedGroupInbound) {
+  const cleanText = String(text ?? "").trim();
+  if (!cleanText) return "";
+
+  const payload = {
+    type: "carrier_group_reply",
+    version: 1,
+    chat_type: "group",
+    source: "openclaw_beagle_channel",
+    group: {
+      userid: parsedGroup.groupUserId || undefined,
+      address: parsedGroup.groupAddress
+    },
+    message: {
+      text: cleanText
+    }
+  };
+  return `${CARRIER_GROUP_REPLY_PREFIX}${JSON.stringify(payload)}`;
+}
 
 function normalizePeerId(value: any) {
   return String(value ?? "")
@@ -24,6 +142,20 @@ function isLikelyBeaglePeerId(value: any) {
   if (!raw) return false;
   // Carrier IDs are base58-like and case-sensitive; keep original case.
   return /^[1-9A-HJ-NP-Za-km-z]{30,120}$/.test(raw);
+}
+
+function normalizeAddress(value: any) {
+  return String(value ?? "").trim();
+}
+
+function toNormalizedSet(values: any, normalize: (value: any) => string) {
+  const set = new Set<string>();
+  if (!Array.isArray(values)) return set;
+  for (const value of values) {
+    const normalized = normalize(value);
+    if (normalized) set.add(normalized);
+  }
+  return set;
 }
 
 function parseMediaDirectiveInText(text: any) {
@@ -197,7 +329,7 @@ export default function register(api: any) {
       aliases: ["beagle-chat", "beagle"]
     },
     capabilities: {
-      chatTypes: ["direct"],
+      chatTypes: ["direct", "group"],
       media: true
     },
     config: {
@@ -331,12 +463,44 @@ async function handleInboundEvent(api: any, accountId: string, account: BeagleAc
     const hasInboundMedia = Boolean(inboundMediaUrl || inboundMediaPath);
     const rawTs = ev?.ts ?? 0;
     const normalizedTs = rawTs > 10_000_000_000_000 ? Math.floor(rawTs / 1000) : rawTs;
-    const timestamp = normalizedTs || Date.now();
+    const baseTimestamp = normalizedTs || Date.now();
     const dispatchStart = Date.now();
 
     const peerId = String(ev?.peer ?? "");
     const normalizedPeerId = normalizePeerId(peerId);
-    const canonicalId = canonicalPeerId(peerId) || normalizedPeerId;
+    const parsedGroup = parseCarrierGroupInbound(rawBody);
+    const trustedPeerSet = toNormalizedSet(
+      [...(account.groupPeers ?? []), ...(account.trustedGroupPeers ?? [])],
+      normalizePeerId
+    );
+    const trustedAddressSet = toNormalizedSet(
+      account.trustedGroupAddresses ?? [],
+      normalizeAddress
+    );
+    const requireTrustedGroup = Boolean(account.requireTrustedGroup);
+    const hasTrustConfig = trustedPeerSet.size > 0 || trustedAddressSet.size > 0;
+
+    let trustedGroup = false;
+    if (parsedGroup) {
+      trustedGroup =
+        trustedPeerSet.has(normalizedPeerId) || trustedAddressSet.has(parsedGroup.groupAddress);
+      if (requireTrustedGroup && !trustedGroup) {
+        api?.logger?.warn?.(
+          `[beagle] reject untrusted group envelope peer=${normalizedPeerId} address=${parsedGroup.groupAddress}`
+        );
+      } else if (!trustedGroup && hasTrustConfig) {
+        api?.logger?.warn?.(
+          `[beagle] accept unsigned group envelope (not allowlisted) peer=${normalizedPeerId} address=${parsedGroup.groupAddress}`
+        );
+      }
+    }
+
+    const isGroup = Boolean(parsedGroup) && (!requireTrustedGroup || trustedGroup);
+    const conversationId = isGroup ? (parsedGroup?.groupUserId || normalizedPeerId) : normalizedPeerId;
+    const timestamp = isGroup ? (parsedGroup?.timestamp || baseTimestamp) : baseTimestamp;
+    const senderId = isGroup ? (parsedGroup?.originUserId || peerId) : peerId;
+    const senderName = isGroup ? (parsedGroup?.originNickname || senderId) : senderId;
+    const canonicalId = canonicalPeerId(conversationId) || conversationId;
     const eventId = String(ev?.msgId ?? "");
     const dedupeKey = [
       accountId,
@@ -352,17 +516,36 @@ async function handleInboundEvent(api: any, accountId: string, account: BeagleAc
       api?.logger?.info?.(`[beagle] skip duplicate inbound event peer=${normalizedPeerId} msgId=${eventId || "(none)"}`);
       return;
     }
-    const route = core.channel.routing.resolveAgentRoute({
-      cfg: api?.config ?? {},
-      channel: "beagle",
-      accountId,
-      peer: {
-        kind: "dm",
-        id: normalizedPeerId
-      }
-    });
 
-    const sessionKey = `beagle:${accountId}:${canonicalId}`;
+    let route: any;
+    try {
+      route = core.channel.routing.resolveAgentRoute({
+        cfg: api?.config ?? {},
+        channel: "beagle",
+        accountId,
+        peer: {
+          kind: isGroup ? "group" : "dm",
+          id: conversationId
+        }
+      });
+    } catch (groupRouteErr: any) {
+      if (!isGroup) throw groupRouteErr;
+      api?.logger?.warn?.(
+        `[beagle] group route fallback to dm: ${String(groupRouteErr)}`
+      );
+      route = core.channel.routing.resolveAgentRoute({
+        cfg: api?.config ?? {},
+        channel: "beagle",
+        accountId,
+        peer: {
+          kind: "dm",
+          id: conversationId
+        }
+      });
+    }
+
+    const sessionScope = isGroup ? "group" : "dm";
+    const sessionKey = `beagle:${accountId}:${sessionScope}:${conversationId}`;
 
     const storePath = core.channel.session.resolveStorePath(api?.config?.session?.store, {
       agentId: route.agentId
@@ -374,18 +557,27 @@ async function handleInboundEvent(api: any, accountId: string, account: BeagleAc
     const mediaHint = hasInboundMedia
       ? `Image attached${inboundFilename ? `: ${inboundFilename}` : ""}.`
       : "";
-    const body = rawBody || mediaHint;
+    const body = parsedGroup?.messageText || rawBody || mediaHint;
+    const groupMetaNote = isGroup
+      ? `\n[Beagle group context]\n` +
+        `ChatType: group\n` +
+        `GroupUserId: ${parsedGroup?.groupUserId || normalizedPeerId}\n` +
+        `GroupAddress: ${parsedGroup?.groupAddress || ""}\n` +
+        `GroupName: ${parsedGroup?.groupNickname || ""}\n` +
+        `OriginalSenderUserId: ${parsedGroup?.originUserId || ""}\n` +
+        `OriginalSenderName: ${parsedGroup?.originNickname || ""}`
+      : "";
     const bodyForAgent =
-      `${body}\n\n` +
+      `${body}${groupMetaNote}\n\n` +
       `[Beagle channel note: do not call the "message" tool for this conversation. ` +
       `Reply with plain text. If you need to send media, include one line: MEDIA:<local_file_path>]`;
 
     const ctxPayload = core.channel.reply.finalizeInboundContext({
       Body: body,
       BodyForAgent: bodyForAgent,
-      BodyForCommands: rawBody || body,
+      BodyForCommands: body,
       RawBody: rawBody || body,
-      CommandBody: rawBody || body,
+      CommandBody: body,
       MediaUrl: inboundMediaUrl,
       MediaPath: inboundMediaPath,
       MediaType: inboundMediaType,
@@ -394,23 +586,33 @@ async function handleInboundEvent(api: any, accountId: string, account: BeagleAc
       MediaTypes: inboundMediaType ? [inboundMediaType] : undefined,
       Filename: inboundFilename,
       MediaSize: inboundSize,
-      From: `beagle:${peerId}`,
-      To: `beagle:${normalizedPeerId}`,
+      From: `beagle:${senderId}`,
+      To: `beagle:${conversationId}`,
       SessionKey: sessionKey,
       AccountId: route.accountId,
-      ChatType: "direct",
-      ConversationLabel: peerId,
-      SenderId: peerId,
+      ChatType: isGroup ? "group" : "direct",
+      ConversationLabel: isGroup
+        ? (parsedGroup?.groupNickname || parsedGroup?.groupAddress || conversationId)
+        : peerId,
+      SenderId: senderId,
+      SenderDisplayName: senderName,
+      GroupId: isGroup ? (parsedGroup?.groupUserId || conversationId) : undefined,
+      GroupAddress: isGroup ? parsedGroup?.groupAddress : undefined,
+      GroupName: isGroup ? parsedGroup?.groupNickname : undefined,
+      GroupPeer: isGroup ? normalizedPeerId : undefined,
+      OriginSenderId: isGroup ? parsedGroup?.originUserId : undefined,
+      OriginSenderName: isGroup ? parsedGroup?.originNickname : undefined,
+      CarrierGroupEnvelope: isGroup ? parsedGroup?.envelope : undefined,
       Provider: "beagle",
       Surface: "beagle",
       MessageSid: ev?.msgId,
       Timestamp: timestamp,
       OriginatingChannel: "beagle",
-      OriginatingTo: `beagle:${normalizedPeerId}`
+      OriginatingTo: `beagle:${conversationId}`
     });
 
     api?.logger?.info?.(
-      `[beagle] route agent=${route.agentId} session=${sessionKey} media_path=${inboundMediaPath || "(none)"} media_type=${inboundMediaType || "(none)"}`
+      `[beagle] route agent=${route.agentId} chat_type=${isGroup ? "group" : "direct"} session=${sessionKey} media_path=${inboundMediaPath || "(none)"} media_type=${inboundMediaType || "(none)"}`
     );
     await core.channel.session.recordInboundSession({
       storePath,
@@ -422,7 +624,7 @@ async function handleInboundEvent(api: any, accountId: string, account: BeagleAc
     });
 
     const client = createSidecarClient(account);
-    if (!hasInboundMedia && isPictureRequest(rawBody)) {
+    if (!hasInboundMedia && isPictureRequest(body)) {
       const fallbackImage = resolveDefaultReplyImagePath();
       if (fallbackImage) {
         api?.logger?.info?.(`[beagle] picture shortcut sendMedia path=${fallbackImage}`);
@@ -468,11 +670,14 @@ async function handleInboundEvent(api: any, accountId: string, account: BeagleAc
           const media = coerceMediaInput(mediaPath, mediaUrl);
           mediaPath = media.mediaPath;
           mediaUrl = media.mediaUrl;
+          const replyText = isGroup
+            ? buildCarrierGroupReplyText(captionText, parsedGroup as ParsedGroupInbound)
+            : captionText;
           if (mediaUrl || mediaPath) {
             api?.logger?.info?.("[beagle] sendMedia");
             await client.sendMedia({
               peer: normalizedPeerId,
-              caption: captionText,
+              caption: replyText,
               mediaUrl,
               mediaPath,
               mediaType,
@@ -480,9 +685,9 @@ async function handleInboundEvent(api: any, accountId: string, account: BeagleAc
             });
             return;
           }
-          if (captionText) {
+          if (replyText) {
             api?.logger?.info?.("[beagle] sendText");
-            await client.sendText({ peer: normalizedPeerId, text: captionText });
+            await client.sendText({ peer: normalizedPeerId, text: replyText });
           }
         },
         onError: (err: any, info: any) => {

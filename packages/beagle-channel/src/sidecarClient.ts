@@ -3,6 +3,10 @@ export type BeagleAccount = {
   enabled?: boolean;
   sidecarBaseUrl: string;
   authToken?: string;
+  trustedGroupPeers?: string[];
+  trustedGroupAddresses?: string[];
+  groupPeers?: string[];
+  requireTrustedGroup?: boolean;
 };
 
 export type SidecarEvent = {
