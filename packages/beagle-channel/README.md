@@ -4,10 +4,6 @@ This package provides a Beagle Chat channel plugin for OpenClaw. It connects to 
 
 ## Config
 
-Example file:
-
-- `examples/openclaw.beagle.config.example.json`
-
 ```json
 {
   "channels": {

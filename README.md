@@ -34,10 +34,6 @@ Then start the sidecar and enable the channel in OpenClaw:
 ./packages/beagle-sidecar/build/beagle-sidecar --port 39091
 ```
 
-Config template:
-
-- `examples/openclaw.beagle.config.example.json`
-
 ```json
 {
   "channels": {
