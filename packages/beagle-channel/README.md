@@ -58,6 +58,13 @@ Restart OpenClaw after installing.
 - Group-context replies encoded as `CGR1` envelope back to CarrierGroup
 - Agent status signaling via sidecar `sendStatus` (`CGS1` for group, `BGS1` for DM)
 
+Status signaling is disabled by default to avoid raw `CGS1/BGS1` text in clients that have not implemented status-envelope parsing yet.
+Enable it explicitly with:
+
+```bash
+export BEAGLE_STATUS_ENABLED=1
+```
+
 ## Development
 
 ```bash

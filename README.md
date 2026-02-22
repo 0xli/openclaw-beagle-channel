@@ -113,3 +113,4 @@ See `packages/beagle-channel/README.md` for full plugin documentation.
   - inbound `CGP1` -> group context mapping
   - outbound group replies as `CGR1`
   - outbound transient status as `CGS1` (group) or `BGS1` (DM)
+  - status emission is opt-in via `BEAGLE_STATUS_ENABLED=1` (default off)

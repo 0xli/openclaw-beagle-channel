@@ -69,6 +69,11 @@ type ParsedGroupInbound = {
 
 type AgentStatusState = "typing" | "thinking" | "tool" | "sending" | "idle" | "error";
 
+function envTruthy(value: any) {
+  const text = String(value ?? "").trim().toLowerCase();
+  return text === "1" || text === "true" || text === "yes" || text === "on";
+}
+
 function buildStatusText({
   state,
   phase,
@@ -754,12 +759,17 @@ async function handleInboundEvent(api: any, accountId: string, account: BeagleAc
       api?.logger?.warn?.("[beagle] picture shortcut requested but no default image found");
     }
 
+    const statusEnabled = envTruthy((globalThis as any)?.process?.env?.BEAGLE_STATUS_ENABLED);
     const statusTtlMs = Number((globalThis as any)?.process?.env?.BEAGLE_STATUS_TTL_MS || 12000);
     const statusMinIntervalMs = Number((globalThis as any)?.process?.env?.BEAGLE_STATUS_MIN_INTERVAL_MS || 2500);
     let lastStatusState = "";
     let lastStatusPhase = "";
     let lastStatusSentAt = 0;
+    const sentStatusKeys = new Set<string>();
     const sendStatus = async (state: AgentStatusState, phase = "", force = false) => {
+      if (!statusEnabled) return;
+      const statusKey = `${state}\u0001${phase}`;
+      if (sentStatusKeys.has(statusKey)) return;
       const now = Date.now();
       if (!force && state === lastStatusState && phase === lastStatusPhase && now - lastStatusSentAt < statusMinIntervalMs) {
         return;
@@ -788,6 +798,7 @@ async function handleInboundEvent(api: any, accountId: string, account: BeagleAc
         lastStatusState = state;
         lastStatusPhase = phase;
         lastStatusSentAt = now;
+        sentStatusKeys.add(statusKey);
         api?.logger?.info?.(`[beagle] sendStatus state=${state} phase=${phase || "(none)"} text_len=${text.length}`);
       } catch (statusErr: any) {
         api?.logger?.warn?.(`[beagle] sendStatus failed state=${state}: ${String(statusErr)}`);
@@ -865,10 +876,10 @@ async function handleInboundEvent(api: any, accountId: string, account: BeagleAc
           void sendStatus("typing", "thinking");
         },
         onIdle: () => {
-          void sendStatus("idle", "complete", true);
+          void sendStatus("idle", "complete", false);
         },
         onCleanup: () => {
-          void sendStatus("idle", "cleanup", true);
+          void sendStatus("idle", "complete", false);
         },
         onError: (err: any, info: any) => {
           void sendStatus("error", String(info?.kind ?? "unknown"), true);
