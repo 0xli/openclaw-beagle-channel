@@ -12,7 +12,7 @@ Clone these two repositories to get started:
 
 ```bash
 # 1. Elastos Carrier Native SDK (the P2P networking layer)
-git clone https://github.com/0xli/Elastos.NET.Carrier.Native.SDK.git
+git clone https://github.com/decentnetworks/Elastos.NET.Carrier.Native.SDK.git
 
 # 2. OpenClaw Beagle Channel (the OpenClaw integration)
 git clone https://github.com/decentnetworks/openclaw-beagle-channel.git
